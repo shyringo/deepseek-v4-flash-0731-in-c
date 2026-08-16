@@ -10,7 +10,7 @@ jobs:
     name: Ubuntu / GCC strict + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc make
       - name: Build and test (strict)
@@ -20,7 +20,7 @@ jobs:
     name: Ubuntu / Clang strict + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y clang make
       - name: Build and test (strict, Clang)
@@ -30,7 +30,7 @@ jobs:
     name: macOS / Apple Clang + OpenMP tests
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenMP runtime
         run: brew install libomp
       - name: Build and test
@@ -40,7 +40,7 @@ jobs:
     name: CMake + CTest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc cmake
       - name: Configure
@@ -54,7 +54,7 @@ jobs:
     name: ASan + UBSan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc make
       - name: Build and test under ASan+UBSan
@@ -64,7 +64,7 @@ jobs:
     name: Tokenizer parity vs tokenizers==0.22.0
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -86,7 +86,7 @@ jobs:
     name: Shell syntax + manifest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Shell syntax check
@@ -102,6 +102,6 @@ jobs:
     name: Download resume integration test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run the 64 KiB flaky-server resume test
         run: tests/integration/test_download_resume.sh
