@@ -110,6 +110,8 @@ TTFT 是提交消息到首个 token 可见的时间；TPOT 是首个 token 之�
 | 同一普通回答，降低内存预算 | 5 / 64 | 15 GiB | 20.560 s | 1.791 s/token | 0.56 token/s | 77.84 GiB | 18.95 GiB |
 | 完整重复内容续写，Prompt lookup 命中 | 10 / 60 | 18 GiB | 26.748 s | **0.892 s/token** | **1.12 token/s** | 53.64 GiB | 22.19 GiB |
 
+如果你使用了不同硬件，欢迎[提交一份可复现的性能结果](https://github.com/shyringo/deepseek-v4-flash-0731-in-c/issues/new?template=benchmark_result.yml)。
+
 0.892 s/token 是完整生成 20 行、共 60 个 token 后得到的最好结果。4 轮主模型
 验证接受了 50/51 个 draft token；所有文本均由主模型确认，猜错的 token 不会
 输出，也不会留在上下文中。普通回答没有可复用片段时，Prompt lookup 不启动，

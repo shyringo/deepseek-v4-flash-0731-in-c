@@ -1,0 +1,66 @@
+name: Benchmark result
+description: Share a reproducible DeepSeek-V4-Flash-0731 hardware result
+title: "[benchmark] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing the engine. Complete measurements make expert streaming, memory budgets and CPU results comparable across laptops.
+  - type: input
+    id: commit
+    attributes:
+      label: Engine commit
+      description: Output of `git rev-parse HEAD`.
+      placeholder: 40-character commit SHA
+    validations: {required: true}
+  - type: input
+    id: checkpoint
+    attributes:
+      label: Checkpoint revision
+      placeholder: ModelScope revision or all-shard manifest hash
+    validations: {required: true}
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and operating system
+      description: CPU, installed/visible RAM, SSD, checkpoint filesystem, OS/WSL version and compiler.
+      placeholder: Intel Core i5-1340P; 32 GB; NVMe/ext4; WSL2 Ubuntu 22.04; GCC 11.4
+    validations: {required: true}
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and environment
+      description: Include `DSV4_MEMORY_GIB`, OpenMP settings and relevant flags.
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Prompt/output tokens, context, thread count, sampling/greedy mode, prompt lookup state, and warm/cold page state.
+    validations: {required: true}
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Report TTFT, TPOT, token/s, expert reads/wait, peak RSS and total wall time.
+    validations: {required: true}
+  - type: textarea
+    id: verification
+    attributes:
+      label: Correctness checks
+      description: Include `make test` status and whether output IDs matched an expected result.
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes:
+      label: Raw benchmark output
+      render: text
+  - type: checkboxes
+    id: publish
+    attributes:
+      label: Community table
+      options:
+        - label: This result may be quoted in a repository community benchmark table with attribution to this issue.
+

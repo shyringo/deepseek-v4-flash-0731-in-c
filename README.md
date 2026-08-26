@@ -114,6 +114,8 @@ passed the output checks. Values from different runs are never combined:
 | same ordinary answer, lower memory budget | 5 / 64 | 15 GiB | 20.560 s | 1.791 s/token | 0.56 token/s | 77.84 GiB | 18.95 GiB |
 | complete repeated continuation, prompt-lookup match | 10 / 60 | 18 GiB | 26.748 s | **0.892 s/token** | **1.12 token/s** | 53.64 GiB | 22.19 GiB |
 
+Ran it on different hardware? [Share a reproducible benchmark](https://github.com/shyringo/deepseek-v4-flash-0731-in-c/issues/new?template=benchmark_result.yml).
+
 The 0.892 s/token result completed all 20 requested lines and 60 generated
 tokens. Four target-model verification rounds accepted 50 of 51 draft tokens;
 every displayed token was confirmed by the full model. If an ordinary answer
