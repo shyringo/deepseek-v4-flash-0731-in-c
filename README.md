@@ -219,6 +219,13 @@ the complete commands and evidence.
 See [DSV4_ARCHITECTURE.md](docs/DSV4_ARCHITECTURE.md) for the model graph and
 memory layout.
 
+## Related Project
+
+For a smaller dense-model option, see
+[qwen3.8-27b-in-c](https://github.com/shyringo/qwen3.8-27b-in-c): run
+Qwen3.8-27B GGUFs on one laptop CPU, with a tested 8 GB memory path and up to
+2.52 token/s on the reference machine.
+
 ## License and Acknowledgements
 
 The code is licensed under Apache License 2.0. See [LICENSE](LICENSE) and
