@@ -13,14 +13,22 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <strings.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "dsv4.h"
+#include "dsv4_http.h"
 #include "dsv4_internal.h"
 
 #pragma GCC diagnostic push
@@ -36,6 +44,7 @@ static void usage(const char *prog)
 "  --model DIR           checkpoint directory (config.json + 48 safetensors)\n"
 "  --prompt TEXT         user text (initial turn with --interactive)\n"
 "  --interactive         keep model, caches and chat context resident\n"
+"  --server PORT         loopback OpenAI-compatible HTTP server\n"
 "  --validate-only       open and verify metadata, then exit\n"
 "  --max-tokens N        optional hard cap per response (default: until EOS)\n"
 "  --context N           context window (default: automatic from memory budget)\n"
@@ -76,6 +85,35 @@ typedef struct {
     double weight;
     int id;
 } SampleItem;
+
+typedef struct {
+    int (*write)(void *context, const char *data, size_t length);
+    void *context;
+    int bytes;
+    unsigned char last_byte;
+    int failed;
+    int append_final_newline;
+} DSV4Output;
+
+static int output_file_write(void *context, const char *data, size_t length)
+{
+    FILE *file = (FILE *)context;
+    return fwrite(data, 1, length, file) == length && fflush(file) == 0;
+}
+
+static int output_write(DSV4Output *output, const char *data, size_t length)
+{
+    if (!output || output->failed || !output->write ||
+        !output->write(output->context, data, length)) {
+        if (output) output->failed = 1;
+        return 0;
+    }
+    if (length) {
+        output->bytes += (int)length;
+        output->last_byte = (unsigned char)data[length - 1u];
+    }
+    return 1;
+}
 
 static int sample_item_desc(const void *ap, const void *bp)
 {
@@ -361,17 +399,14 @@ static int argmax_logits(const float *logits, int vocab)
 }
 
 static void emit_token(Tok *tok, int token, char *piece, size_t piece_cap,
-                       int *output_bytes, unsigned char *last_output_byte)
+                       DSV4Output *output)
 {
     if (token != 1) {
         int plen = tok_decode(tok, &token, 1, piece, (int)piece_cap - 1);
         if (plen > 0) {
-            fwrite(piece, 1, (size_t)plen, stdout);
-            *output_bytes += plen;
-            *last_output_byte = (unsigned char)piece[plen - 1];
+            (void)output_write(output, piece, (size_t)plen);
         }
     }
-    fflush(stdout);
 }
 
 static int prefill_with_dspark_state(DSV4Model *m, const DSV4Config *cfg,
@@ -414,12 +449,593 @@ static int read_chat_line(char **line, size_t *cap)
     }
 }
 
+typedef struct {
+    char method[8];
+    char path[128];
+    char *body;
+    size_t body_length;
+} DSV4IncomingRequest;
+
+typedef struct DSV4ServerCall DSV4ServerCall;
+
+typedef struct {
+    DSV4ServerCall *call;
+    DSV4Utf8Stream utf8;
+} DSV4ServerStream;
+
+struct DSV4ServerCall {
+    int client;
+    int streaming;
+    int include_usage;
+    int output_started;
+    int has_max_tokens;
+    int has_seed;
+    int has_temperature;
+    int has_top_p;
+    uint32_t max_tokens;
+    uint64_t seed;
+    double temperature;
+    double top_p;
+    long long created;
+    char id[96];
+    char *rendered_prompt;
+    DSV4Buffer answer;
+    DSV4ServerStream stream;
+    DSV4Output output;
+};
+
+static int server_buffer_write(void *context, const char *data, size_t length)
+{
+    return dsv4_buffer_append((DSV4Buffer *)context, data, length);
+}
+
+static int server_socket_send_all(int client, const char *data, size_t length)
+{
+    while (length) {
+        const ssize_t sent = send(client, data, length, 0);
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent <= 0) return 0;
+        data += (size_t)sent;
+        length -= (size_t)sent;
+    }
+    return 1;
+}
+
+static int server_response(int client, int status, const char *reason,
+                           const char *content_type,
+                           const char *body, size_t body_length)
+{
+    char header[1024];
+    const int length = snprintf(
+        header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Connection: close\r\n\r\n",
+        status, reason, content_type, body_length);
+    return length > 0 && (size_t)length < sizeof(header) &&
+           server_socket_send_all(client, header, (size_t)length) &&
+           server_socket_send_all(client, body ? body : "", body_length);
+}
+
+static int server_error_response(int client, int status,
+                                 const char *reason, const char *message)
+{
+    DSV4Buffer body;
+    dsv4_buffer_init(&body);
+    int ok = dsv4_buffer_append_string(&body, "{\"error\":{\"message\":") &&
+             dsv4_buffer_append_json_string(&body, message, strlen(message)) &&
+             dsv4_buffer_append_string(
+                 &body, ",\"type\":\"invalid_request_error\"}}");
+    if (ok) ok = server_response(client, status, reason,
+                                  "application/json; charset=utf-8",
+                                  body.data, body.length);
+    dsv4_buffer_free(&body);
+    return ok;
+}
+
+static int server_parse_content_length(const char *text, size_t *length)
+{
+    if (!text || !*text || *text == '-') return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long value = strtoull(text, &end, 10);
+    if (errno || end == text || *end || value > DSV4_HTTP_MAX_BODY) return 0;
+    *length = (size_t)value;
+    return 1;
+}
+
+static int server_read_request(int client, DSV4IncomingRequest *request,
+                               char *error, size_t error_capacity)
+{
+    enum { MAX_HEADER = 32 * 1024 };
+    char header[MAX_HEADER + 1];
+    size_t used = 0;
+    char *separator = NULL;
+    memset(request, 0, sizeof(*request));
+    while (!separator) {
+        if (used == MAX_HEADER) {
+            snprintf(error, error_capacity, "request headers are too large");
+            return 0;
+        }
+        const ssize_t received = recv(client, header + used,
+                                      MAX_HEADER - used, 0);
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) {
+            snprintf(error, error_capacity,
+                     "request ended before headers completed");
+            return 0;
+        }
+        used += (size_t)received;
+        header[used] = '\0';
+        separator = strstr(header, "\r\n\r\n");
+    }
+    const size_t body_offset = (size_t)(separator - header) + 4u;
+    *separator = '\0';
+    char *line_end = strstr(header, "\r\n");
+    if (!line_end) {
+        snprintf(error, error_capacity, "invalid HTTP request line");
+        return 0;
+    }
+    *line_end = '\0';
+    char version[16];
+    if (sscanf(header, "%7s %127s HTTP/%15s",
+               request->method, request->path, version) != 3 ||
+        (strcmp(version, "1.1") != 0 && strcmp(version, "1.0") != 0)) {
+        snprintf(error, error_capacity, "invalid HTTP request line");
+        return 0;
+    }
+    size_t content_length = 0;
+    int saw_content_length = 0;
+    char *line = line_end + 2;
+    while (*line) {
+        char *next = strstr(line, "\r\n");
+        if (next) *next = '\0';
+        if (strncasecmp(line, "Content-Length:", 15u) == 0) {
+            const char *value = line + 15;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (saw_content_length ||
+                !server_parse_content_length(value, &content_length)) {
+                snprintf(error, error_capacity, "invalid Content-Length");
+                return 0;
+            }
+            saw_content_length = 1;
+        } else if (strncasecmp(line, "Transfer-Encoding:", 18u) == 0) {
+            snprintf(error, error_capacity,
+                     "chunked requests are not supported");
+            return 0;
+        }
+        if (!next) break;
+        line = next + 2;
+    }
+    if (strcmp(request->method, "POST") == 0 && !saw_content_length) {
+        snprintf(error, error_capacity, "POST requires Content-Length");
+        return 0;
+    }
+    request->body = (char *)malloc(content_length + 1u);
+    if (!request->body) {
+        snprintf(error, error_capacity, "out of memory reading request");
+        return 0;
+    }
+    size_t copied = used > body_offset ? used - body_offset : 0u;
+    if (copied > content_length) copied = content_length;
+    if (copied) memcpy(request->body, header + body_offset, copied);
+    while (copied < content_length) {
+        const ssize_t received = recv(client, request->body + copied,
+                                      content_length - copied, 0);
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) {
+            free(request->body);
+            request->body = NULL;
+            snprintf(error, error_capacity, "request body ended early");
+            return 0;
+        }
+        copied += (size_t)received;
+    }
+    request->body[content_length] = '\0';
+    request->body_length = content_length;
+    return 1;
+}
+
+static int server_open(uint32_t port)
+{
+    const int server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server < 0) {
+        perror("dsv4: socket");
+        return -1;
+    }
+    int reuse = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+        fprintf(stderr, "dsv4: unable to create loopback address\n");
+        close(server);
+        return -1;
+    }
+    address.sin_port = htons((uint16_t)port);
+    if (bind(server, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(server, 16) != 0) {
+        perror("dsv4: bind/listen");
+        close(server);
+        return -1;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    return server;
+}
+
+static int server_buffer_printf(DSV4Buffer *buffer, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    const int needed = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    if (needed < 0) {
+        va_end(args);
+        return 0;
+    }
+    char *text = (char *)malloc((size_t)needed + 1u);
+    if (!text) {
+        va_end(args);
+        return 0;
+    }
+    vsnprintf(text, (size_t)needed + 1u, format, args);
+    va_end(args);
+    const int ok = dsv4_buffer_append(buffer, text, (size_t)needed);
+    free(text);
+    return ok;
+}
+
+static int server_stream_headers(int client)
+{
+    static const char headers[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "X-Accel-Buffering: no\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Connection: close\r\n\r\n";
+    return server_socket_send_all(client, headers, sizeof(headers) - 1u);
+}
+
+static int server_stream_send(DSV4ServerCall *call, DSV4Buffer *event)
+{
+    const int ok = dsv4_buffer_append_string(event, "\n\n") &&
+                   server_socket_send_all(call->client,
+                                          event->data, event->length);
+    dsv4_buffer_free(event);
+    return ok;
+}
+
+static int server_stream_role(DSV4ServerCall *call)
+{
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    const int ok = server_buffer_printf(
+        &event,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+        "\"content\":\"\"},\"finish_reason\":null}]%s}",
+        call->id, call->created,
+        call->include_usage ? ",\"usage\":null" : "");
+    if (!ok) {
+        dsv4_buffer_free(&event);
+        return 0;
+    }
+    return server_stream_send(call, &event);
+}
+
+static int server_stream_content(void *context,
+                                 const char *data, size_t length)
+{
+    DSV4ServerCall *call = (DSV4ServerCall *)context;
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    int ok = server_buffer_printf(
+        &event,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":",
+        call->id, call->created);
+    if (ok) ok = dsv4_buffer_append_json_string(&event, data, length);
+    if (ok) ok = server_buffer_printf(
+        &event, "},\"finish_reason\":null}]%s}",
+        call->include_usage ? ",\"usage\":null" : "");
+    if (!ok) {
+        dsv4_buffer_free(&event);
+        return 0;
+    }
+    return server_stream_send(call, &event);
+}
+
+static int server_call_begin(DSV4ServerCall *call)
+{
+    call->output_started = 1;
+    call->output.bytes = 0;
+    call->output.last_byte = 0;
+    call->output.failed = 0;
+    call->output.append_final_newline = 0;
+    if (!call->streaming) {
+        call->output.write = server_buffer_write;
+        call->output.context = &call->answer;
+        return 1;
+    }
+    call->stream.call = call;
+    dsv4_utf8_stream_init(&call->stream.utf8,
+                          server_stream_content, call);
+    call->output.write = dsv4_utf8_stream_write;
+    call->output.context = &call->stream.utf8;
+    return server_stream_headers(call->client) && server_stream_role(call);
+}
+
+static int server_stream_finish(DSV4ServerCall *call, int prompt_tokens,
+                                int generated_tokens, int truncated)
+{
+    if (!dsv4_utf8_stream_flush(&call->stream.utf8)) return 0;
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    int ok = server_buffer_printf(
+        &event,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"%s\"}]%s}",
+        call->id, call->created, truncated ? "length" : "stop",
+        call->include_usage ? ",\"usage\":null" : "");
+    if (!ok) {
+        dsv4_buffer_free(&event);
+        return 0;
+    }
+    if (!server_stream_send(call, &event)) return 0;
+    if (call->include_usage) {
+        dsv4_buffer_init(&event);
+        ok = server_buffer_printf(
+            &event,
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+            "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":%d,"
+            "\"completion_tokens\":%d,\"total_tokens\":%d}}",
+            call->id, call->created, prompt_tokens, generated_tokens,
+            prompt_tokens + generated_tokens);
+        if (!ok) {
+            dsv4_buffer_free(&event);
+            return 0;
+        }
+        if (!server_stream_send(call, &event)) return 0;
+    }
+    static const char done[] = "data: [DONE]\n\n";
+    return server_socket_send_all(call->client, done, sizeof(done) - 1u);
+}
+
+static int server_call_finish(DSV4ServerCall *call, int prompt_tokens,
+                              int generated_tokens, int truncated)
+{
+    int ok = 0;
+    if (call->streaming) {
+        ok = server_stream_finish(call, prompt_tokens,
+                                  generated_tokens, truncated);
+    } else {
+        DSV4Buffer response;
+        dsv4_buffer_init(&response);
+        ok = server_buffer_printf(
+            &response,
+            "{\"id\":\"%s\",\"object\":\"chat.completion\","
+            "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+            "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+            "\"content\":",
+            call->id, call->created);
+        if (ok) ok = dsv4_buffer_append_json_string(
+            &response, call->answer.data ? call->answer.data : "",
+            call->answer.length);
+        if (ok) ok = server_buffer_printf(
+            &response,
+            "},\"finish_reason\":\"%s\"}],\"usage\":{"
+            "\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+            "\"total_tokens\":%d}}",
+            truncated ? "length" : "stop", prompt_tokens,
+            generated_tokens, prompt_tokens + generated_tokens);
+        if (ok) ok = server_response(call->client, 200, "OK",
+                                      "application/json; charset=utf-8",
+                                      response.data, response.length);
+        dsv4_buffer_free(&response);
+    }
+    return ok;
+}
+
+static void server_call_dispose(DSV4ServerCall *call)
+{
+    if (!call) return;
+    if (call->streaming && call->output_started)
+        dsv4_utf8_stream_free(&call->stream.utf8);
+    if (call->client >= 0) close(call->client);
+    free(call->rendered_prompt);
+    dsv4_buffer_free(&call->answer);
+    memset(call, 0, sizeof(*call));
+    call->client = -1;
+}
+
+static int server_next_call(int server, const char *base_system,
+                            const char *reasoning_effort, const char *eos_text,
+                            DSV4ServerCall *call)
+{
+    static unsigned long long serial = 0;
+    for (;;) {
+        memset(call, 0, sizeof(*call));
+        call->client = -1;
+        const int client = accept(server, NULL, NULL);
+        if (client < 0 && errno == EINTR) continue;
+        if (client < 0) {
+            perror("dsv4: accept");
+            return 0;
+        }
+        call->client = client;
+        struct timeval timeout = {30, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        DSV4IncomingRequest incoming;
+        char error[256] = {0};
+        if (!server_read_request(client, &incoming, error, sizeof(error))) {
+            (void)server_error_response(client, 400, "Bad Request", error);
+            server_call_dispose(call);
+            continue;
+        }
+        int handled = 1;
+        if (strcmp(incoming.method, "OPTIONS") == 0) {
+            (void)server_response(client, 204, "No Content",
+                                  "application/json; charset=utf-8", "", 0u);
+        } else if (strcmp(incoming.method, "GET") == 0 &&
+                   strcmp(incoming.path, "/health") == 0) {
+            static const char body[] = "{\"status\":\"ok\"}";
+            (void)server_response(client, 200, "OK",
+                                  "application/json; charset=utf-8",
+                                  body, sizeof(body) - 1u);
+        } else if (strcmp(incoming.method, "GET") == 0 &&
+                   strcmp(incoming.path, "/v1/models") == 0) {
+            static const char body[] =
+                "{\"object\":\"list\",\"data\":[{"
+                "\"id\":\"deepseek-v4-flash-0731-in-c\","
+                "\"object\":\"model\",\"owned_by\":\"local\"}]}";
+            (void)server_response(client, 200, "OK",
+                                  "application/json; charset=utf-8",
+                                  body, sizeof(body) - 1u);
+        } else if (strcmp(incoming.method, "POST") != 0 ||
+                   strcmp(incoming.path, "/v1/chat/completions") != 0) {
+            (void)server_error_response(client, 404, "Not Found",
+                                        "unknown endpoint");
+        } else {
+            handled = 0;
+        }
+        if (handled) {
+            free(incoming.body);
+            server_call_dispose(call);
+            continue;
+        }
+        DSV4HttpChatRequest request;
+        if (!dsv4_http_parse_chat_request(incoming.body, incoming.body_length,
+                                          &request, error, sizeof(error))) {
+            free(incoming.body);
+            (void)server_error_response(client, 400, "Bad Request", error);
+            server_call_dispose(call);
+            continue;
+        }
+        free(incoming.body);
+        if (strcmp(request.model, "deepseek-v4-flash-0731-in-c") != 0 &&
+            strcmp(request.model, "deepseek-v4-flash-0731") != 0) {
+            dsv4_http_chat_request_free(&request);
+            (void)server_error_response(client, 404, "Not Found",
+                                        "requested model is not available");
+            server_call_dispose(call);
+            continue;
+        }
+        if (request.has_presence_penalty &&
+            request.presence_penalty != 0.0f) {
+            dsv4_http_chat_request_free(&request);
+            (void)server_error_response(
+                client, 400, "Bad Request",
+                "presence_penalty is not supported by this sampler");
+            server_call_dispose(call);
+            continue;
+        }
+        call->rendered_prompt = dsv4_http_render_messages(
+            &request, base_system, reasoning_effort, eos_text,
+            error, sizeof(error));
+        if (!call->rendered_prompt) {
+            dsv4_http_chat_request_free(&request);
+            (void)server_error_response(client, 400, "Bad Request", error);
+            server_call_dispose(call);
+            continue;
+        }
+        call->streaming = request.stream;
+        call->include_usage = request.include_usage;
+        call->has_max_tokens = request.has_max_tokens;
+        call->max_tokens = request.max_tokens;
+        call->has_seed = request.has_seed;
+        call->seed = request.seed;
+        call->has_temperature = request.has_temperature;
+        call->temperature = request.temperature;
+        call->has_top_p = request.has_top_p;
+        call->top_p = request.top_p;
+        dsv4_http_chat_request_free(&request);
+        call->created = (long long)time(NULL);
+        const int length = snprintf(
+            call->id, sizeof(call->id), "chatcmpl-local-%lld-%llu",
+            call->created, ++serial);
+        if (length <= 0 || (size_t)length >= sizeof(call->id)) {
+            (void)server_error_response(client, 500, "Internal Server Error",
+                                        "unable to create completion id");
+            server_call_dispose(call);
+            continue;
+        }
+        dsv4_buffer_init(&call->answer);
+        return 1;
+    }
+}
+
+static int server_call_tokenize(Tok *tok, DSV4ServerCall *call, int context,
+                                int **ids_out, int *count_out,
+                                char *error, size_t error_capacity)
+{
+    const size_t length = strlen(call->rendered_prompt);
+    if (length > (size_t)INT_MAX - 1u) {
+        snprintf(error, error_capacity, "rendered prompt is too large");
+        return 0;
+    }
+    int *ids = (int *)malloc((length + 1u) * sizeof(int));
+    if (!ids) {
+        snprintf(error, error_capacity, "out of memory tokenizing messages");
+        return 0;
+    }
+    const int count = tok_encode(tok, call->rendered_prompt, (int)length,
+                                 ids, (int)length + 1);
+    if (count <= 0) {
+        free(ids);
+        snprintf(error, error_capacity, "messages produced no tokens");
+        return 0;
+    }
+    if (count >= context) {
+        free(ids);
+        snprintf(error, error_capacity,
+                 "messages need %d tokens but context is %d", count, context);
+        return 0;
+    }
+    *ids_out = ids;
+    *count_out = count;
+    return 1;
+}
+
+static void server_apply_call(const DSV4ServerCall *call,
+                              int default_max_tokens,
+                              double default_temperature,
+                              double default_top_p, uint64_t default_seed,
+                              int *max_tokens, int *max_tokens_set,
+                              double *temperature, double *top_p)
+{
+    *max_tokens = call->has_max_tokens
+                ? (int)call->max_tokens : default_max_tokens;
+    *max_tokens_set = 1;
+    *temperature = call->has_temperature
+                 ? call->temperature : default_temperature;
+    *top_p = call->has_top_p ? call->top_p : default_top_p;
+    const uint64_t request_seed = call->has_seed ? call->seed : default_seed;
+    rng_state = request_seed ? request_seed : 0x9E3779B97F4A7C15ull;
+}
+
 int main(int argc, char **argv)
 {
     const char *model_dir = NULL, *prompt = NULL, *system = NULL, *effort = NULL;
     int max_tokens = 0, max_tokens_set = 0, context = 0, context_set = 0;
     int validate_only = 0;
     int thinking = 0, raw_prompt = 0, interactive = 0, threads = 0;
+    uint32_t server_port = 0;
     int no_prompt_lookup = 0;
     int memory_gib_set = 0, cache_gib_set = 0;
     double memory_gib = 0.0, cache_gib = 0.0, temperature = 1.0, top_p = 1.0;
@@ -446,6 +1062,11 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--raw-prompt")) raw_prompt = 1;
         else if (!strcmp(a, "--no-prompt-lookup")) no_prompt_lookup = 1;
         else if (!strcmp(a, "--interactive")) interactive = 1;
+        else if (!strcmp(a, "--server")) {
+            if (++i >= argc || !parse_int(argv[i], &lv) ||
+                lv < 1 || lv > 65535) goto badnum;
+            server_port = (uint32_t)lv;
+        }
         else if (!strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "%s: unknown option %s\n", argv[0], a); usage(argv[0]); return 2; }
         continue;
@@ -477,6 +1098,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "dsv4: --interactive requires the chat template; remove --raw-prompt\n");
         return 2;
     }
+    if (server_port && (interactive || prompt || raw_prompt || validate_only)) {
+        fprintf(stderr,
+                "dsv4: --server cannot be combined with --prompt, "
+                "--interactive, --raw-prompt or --validate-only\n");
+        return 2;
+    }
     if (max_tokens_set && max_tokens < 1) {
         fprintf(stderr, "dsv4: --max-tokens must be at least 1\n");
         return 2;
@@ -495,6 +1122,14 @@ int main(int argc, char **argv)
              ^ (uint64_t)getpid();
     }
     rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
+    if (server_port && !max_tokens_set) {
+        max_tokens = 1024;
+        max_tokens_set = 1;
+    }
+    const int server_default_max_tokens = max_tokens;
+    const double server_default_temperature = temperature;
+    const double server_default_top_p = top_p;
+    const uint64_t server_default_seed = seed;
     if (!model_dir) { fprintf(stderr, "dsv4: --model DIR is required\n"); usage(argv[0]); return 2; }
 
 #ifdef _OPENMP
@@ -523,7 +1158,7 @@ int main(int argc, char **argv)
     sigint_action.sa_handler = handle_sigint;
     sigemptyset(&sigint_action.sa_mask);
     sigint_action.sa_flags = SA_RESTART;
-    if (sigaction(SIGINT, &sigint_action, NULL) != 0) {
+    if (!server_port && sigaction(SIGINT, &sigint_action, NULL) != 0) {
         perror("dsv4: cannot install SIGINT handler");
         return 1;
     }
@@ -627,63 +1262,105 @@ int main(int argc, char **argv)
 
     char *input_line = NULL;
     size_t input_cap = 0;
-    if (!prompt && interactive) {
-        if (!read_chat_line(&input_line, &input_cap)) return 0;
-        prompt = input_line;
-    }
-    if (!prompt || !prompt[0]) {
-        fprintf(stderr, "dsv4: --prompt TEXT is required unless --interactive reads it\n");
-        return 2;
-    }
-
-    /* ---- render prompt ---- */
-    char *ptext = NULL;
-    int ptext_len = 0;
-    if (raw_prompt) {
-        ptext_len = (int)strlen(prompt ? prompt : "");
-        ptext = (char *)malloc((size_t)ptext_len + 1);
-        if (!ptext) { fprintf(stderr, "dsv4: OOM prompt buffer\n"); return 1; }
-        memcpy(ptext, prompt ? prompt : "", (size_t)ptext_len + 1);
-    } else {
-        const char *eff = thinking ? (effort ? effort : "high") : NULL;
-        int need = dsv4_format_prompt(NULL, 0, prompt ? prompt : "", system, eff);
-        if (need < 0) { fprintf(stderr, "dsv4: empty prompt\n"); return 2; }
-        ptext = (char *)malloc((size_t)need + 1);
-        if (!ptext) { fprintf(stderr, "dsv4: OOM prompt buffer\n"); return 1; }
-        dsv4_format_prompt(ptext, (size_t)need + 1, prompt ? prompt : "", system, eff);
-        ptext_len = need;
-    }
-
-    /* ---- tokenise ---- */
-    int *ids = (int *)malloc((size_t)(ptext_len + 1) * sizeof(int));
-    if (!ids) { fprintf(stderr, "dsv4: OOM token buffer\n"); return 1; }
-    int ntoks = tok_encode(&tok, ptext, ptext_len, ids, ptext_len + 1);
-    if (ntoks <= 0) { fprintf(stderr, "dsv4: prompt produced no tokens\n"); return 2; }
-    if (ntoks >= context) {
-        fprintf(stderr, "dsv4: prompt (%d tokens) leaves no generation room in context %d\n",
-                ntoks, context);
-        return 2;
-    }
-    fprintf(stderr, "prompt: %d tokens\n", ntoks);
-    if (!interactive) {
-        fprintf(stderr, "prompt ids:");
-        for (int i = 0; i < ntoks; i++) fprintf(stderr, " %d", ids[i]);
-        fprintf(stderr, "\n");
-    }
-
-    /* ---- open model ---- */
+    const char *eff = thinking ? (effort ? effort : "high") : NULL;
     DSV4Options opt;
     memset(&opt, 0, sizeof opt);
     opt.max_context = context;
     opt.threads = threads;
     opt.expert_cache_bytes = plan.expert_cache_bytes;
     opt.wo_a_cache_layers = plan.wo_a_cache_layers;
-    DSV4Model *m = dsv4_model_open(model_dir, &opt);
-    if (!m) return 1;
+    DSV4Model *m = NULL;
+    int server_fd = -1;
+    DSV4ServerCall server_call;
+    memset(&server_call, 0, sizeof(server_call));
+    server_call.client = -1;
+    if (server_port) {
+        m = dsv4_model_open(model_dir, &opt);
+        if (!m) return 1;
+        server_fd = server_open(server_port);
+        if (server_fd < 0) return 1;
+        fprintf(stderr,
+                "dsv4: OpenAI-compatible server listening on "
+                "http://127.0.0.1:%u\n", server_port);
+        fprintf(stderr,
+                "dsv4: model id deepseek-v4-flash-0731-in-c; "
+                "one request at a time\n");
+    }
+
+    char *ptext = NULL;
+    int ptext_len = 0;
+    int *ids = NULL;
+    int ntoks = 0;
+    if (server_port) {
+        char request_error[256];
+        for (;;) {
+            if (!server_next_call(server_fd, system, eff, tok.id2str[1],
+                                  &server_call)) return 1;
+            if (server_call_tokenize(&tok, &server_call, context,
+                                     &ids, &ntoks,
+                                     request_error, sizeof(request_error)))
+                break;
+            (void)server_error_response(server_call.client, 400, "Bad Request",
+                                        request_error);
+            server_call_dispose(&server_call);
+        }
+        server_apply_call(&server_call, server_default_max_tokens,
+                          server_default_temperature, server_default_top_p,
+                          server_default_seed, &max_tokens, &max_tokens_set,
+                          &temperature, &top_p);
+    } else {
+        if (!prompt && interactive) {
+            if (!read_chat_line(&input_line, &input_cap)) return 0;
+            prompt = input_line;
+        }
+        if (!prompt || !prompt[0]) {
+            fprintf(stderr,
+                    "dsv4: --prompt TEXT is required unless --interactive reads it\n");
+            return 2;
+        }
+        if (raw_prompt) {
+            ptext_len = (int)strlen(prompt);
+            ptext = (char *)malloc((size_t)ptext_len + 1);
+            if (!ptext) { fprintf(stderr, "dsv4: OOM prompt buffer\n"); return 1; }
+            memcpy(ptext, prompt, (size_t)ptext_len + 1);
+        } else {
+            int need = dsv4_format_prompt(NULL, 0, prompt, system, eff);
+            if (need < 0) { fprintf(stderr, "dsv4: empty prompt\n"); return 2; }
+            ptext = (char *)malloc((size_t)need + 1);
+            if (!ptext) { fprintf(stderr, "dsv4: OOM prompt buffer\n"); return 1; }
+            dsv4_format_prompt(ptext, (size_t)need + 1, prompt, system, eff);
+            ptext_len = need;
+        }
+        ids = (int *)malloc((size_t)(ptext_len + 1) * sizeof(int));
+        if (!ids) { fprintf(stderr, "dsv4: OOM token buffer\n"); return 1; }
+        ntoks = tok_encode(&tok, ptext, ptext_len, ids, ptext_len + 1);
+        if (ntoks <= 0) {
+            fprintf(stderr, "dsv4: prompt produced no tokens\n");
+            return 2;
+        }
+        if (ntoks >= context) {
+            fprintf(stderr,
+                    "dsv4: prompt (%d tokens) leaves no generation room in context %d\n",
+                    ntoks, context);
+            return 2;
+        }
+    }
+    fprintf(stderr, "prompt: %d tokens\n", ntoks);
+    if (!interactive && !server_port) {
+        fprintf(stderr, "prompt ids:");
+        for (int i = 0; i < ntoks; i++) fprintf(stderr, " %d", ids[i]);
+        fprintf(stderr, "\n");
+    }
+
+    /* ---- open model ---- */
+    if (!m) {
+        m = dsv4_model_open(model_dir, &opt);
+        if (!m) return 1;
+    }
 
     /* Keep the speculative path opt-in until its acceptance rate and batched
      * verifier are fast enough to improve end-user latency on the full model. */
-    int use_dspark = temperature == 0.0 && dsv4_dspark_ready(m) &&
+    int use_dspark = !server_port && temperature == 0.0 && dsv4_dspark_ready(m) &&
                      getenv("DSV4_EXPERIMENTAL_DSPARK") != NULL;
     int use_ngram = !no_prompt_lookup;
     if (!no_prompt_lookup && getenv("DSV4_EXPERIMENTAL_NGRAM") != NULL)
@@ -841,7 +1518,7 @@ int main(int argc, char **argv)
     float *logits = (float *)malloc((size_t)cfg.vocab * sizeof(float));
     if (!logits) { fprintf(stderr, "dsv4: OOM logits\n"); return 1; }
     SampleItem *sample_items = NULL;
-    if (temperature > 0.0) {
+    if (temperature > 0.0 || server_port) {
         sample_items = (SampleItem *)malloc((size_t)cfg.vocab * sizeof(*sample_items));
         if (!sample_items) { fprintf(stderr, "dsv4: OOM sampling buffer\n"); return 1; }
     }
@@ -860,11 +1537,15 @@ int main(int argc, char **argv)
     }
     char *piece = (char *)malloc(piece_cap);
     if (!piece) { fprintf(stderr, "dsv4: OOM decode buffer\n"); return 1; }
-    const char *eff = thinking ? (effort ? effort : "high") : NULL;
     int committed = ntoks;
     int prefill_tokens = ntoks;
     stop_generation = 0;
     double inference_start = now_s();
+    DSV4Output output = {output_file_write, stdout, 0, 0, 0, 1};
+    if (server_port) {
+        if (!server_call_begin(&server_call)) return 1;
+        output = server_call.output;
+    }
     if (interactive && isatty(STDIN_FILENO)) {
         fputs("assistant> ", stdout);
         fflush(stdout);
@@ -884,8 +1565,9 @@ int main(int argc, char **argv)
         int spec_cache_expanded = 0;
         int ngram_cooldown = 0;
         int ngram_cache_expanded = 0;
-        int output_bytes = 0;
-        unsigned char last_output_byte = 0;
+        output.bytes = 0;
+        output.last_byte = 0;
+        output.failed = 0;
         double first_token_at = 0.0, last_token_at = 0.0;
         int response_limit = context - committed;
         if (max_tokens_set && max_tokens < response_limit) response_limit = max_tokens;
@@ -897,8 +1579,7 @@ int main(int argc, char **argv)
             generated[gen++] = nid;
             pending = nid;
             history[history_len++] = nid;
-            emit_token(&tok, nid, piece, piece_cap, &output_bytes,
-                       &last_output_byte);
+            emit_token(&tok, nid, piece, piece_cap, &output);
             last_token_at = now_s();
             first_token_at = last_token_at;
         }
@@ -981,8 +1662,7 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             ngram_outputs++;
                         }
@@ -998,16 +1678,14 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             ngram_outputs++;
                         }
                         generated[gen++] = correction;
                         pending = correction;
                         history[history_len++] = correction;
-                        emit_token(&tok, correction, piece, piece_cap,
-                                   &output_bytes, &last_output_byte);
+                        emit_token(&tok, correction, piece, piece_cap, &output);
                         last_token_at = now_s();
                         ngram_outputs++;
                         handled = 1;
@@ -1027,16 +1705,14 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             ngram_outputs++;
                         }
                         generated[gen++] = bonus;
                         pending = bonus;
                         history[history_len++] = bonus;
-                        emit_token(&tok, bonus, piece, piece_cap,
-                                   &output_bytes, &last_output_byte);
+                        emit_token(&tok, bonus, piece, piece_cap, &output);
                         last_token_at = now_s();
                         ngram_outputs++;
                         handled = 1;
@@ -1111,8 +1787,7 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             spec_outputs++;
                         }
@@ -1133,16 +1808,14 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             spec_outputs++;
                         }
                         generated[gen++] = correction;
                         pending = correction;
                         history[history_len++] = correction;
-                        emit_token(&tok, correction, piece, piece_cap,
-                                   &output_bytes, &last_output_byte);
+                        emit_token(&tok, correction, piece, piece_cap, &output);
                         last_token_at = now_s();
                         spec_outputs++;
                         handled = 1;
@@ -1161,16 +1834,14 @@ int main(int argc, char **argv)
                             generated[gen++] = nid;
                             pending = nid;
                             history[history_len++] = nid;
-                            emit_token(&tok, nid, piece, piece_cap,
-                                       &output_bytes, &last_output_byte);
+                            emit_token(&tok, nid, piece, piece_cap, &output);
                             last_token_at = now_s();
                             spec_outputs++;
                         }
                         generated[gen++] = bonus;
                         pending = bonus;
                         history[history_len++] = bonus;
-                        emit_token(&tok, bonus, piece, piece_cap,
-                                   &output_bytes, &last_output_byte);
+                        emit_token(&tok, bonus, piece, piece_cap, &output);
                         last_token_at = now_s();
                         spec_outputs++;
                         handled = 1;
@@ -1198,16 +1869,20 @@ int main(int argc, char **argv)
             generated[gen++] = nid;
             pending = nid;
             history[history_len++] = nid;
-            emit_token(&tok, nid, piece, piece_cap, &output_bytes,
-                       &last_output_byte);
+            emit_token(&tok, nid, piece, piece_cap, &output);
             last_token_at = now_s();
             if (spec_cooldown > 0) spec_cooldown--;
             if (ngram_cooldown > 0) ngram_cooldown--;
         }
 
-        if (output_bytes == 0 || last_output_byte != '\n') fputc('\n', stdout);
-        fflush(stdout);
-        if (!interactive) {
+        if (output.append_final_newline &&
+            (output.bytes == 0 || output.last_byte != '\n'))
+            (void)output_write(&output, "\n", 1u);
+        if (output.failed) {
+            fprintf(stderr, "dsv4: unable to write generated output\n");
+            if (!server_port) return 1;
+        }
+        if (!interactive && !server_port) {
             fprintf(stderr, "generated ids:");
             for (int i = 0; i < gen; i++) fprintf(stderr, " %d", generated[i]);
             fprintf(stderr, "\n");
@@ -1230,6 +1905,59 @@ int main(int argc, char **argv)
             (void)dsv4_expert_cache_set_hash_slots(m, cfg.topk);
         if (spec_cache_expanded)
             (void)dsv4_expert_cache_set_hash_slots(m, cfg.topk);
+
+        if (server_port) {
+            const int truncated = pending != 1 && gen >= response_limit;
+            if (!output.failed &&
+                !server_call_finish(&server_call, prefill_tokens,
+                                    gen, truncated))
+                fprintf(stderr,
+                        "dsv4: request ended before a complete response\n");
+            server_call_dispose(&server_call);
+            dsv4_model_reset_context(m);
+            committed = 0;
+            history_len = 0;
+
+            int *next_ids = NULL;
+            int next_count = 0;
+            char request_error[256];
+            for (;;) {
+                if (!server_next_call(server_fd, system, eff, tok.id2str[1],
+                                      &server_call))
+                    goto chat_done;
+                if (server_call_tokenize(&tok, &server_call, context,
+                                         &next_ids, &next_count,
+                                         request_error,
+                                         sizeof(request_error)))
+                    break;
+                (void)server_error_response(server_call.client, 400,
+                                            "Bad Request", request_error);
+                server_call_dispose(&server_call);
+            }
+            server_apply_call(&server_call, server_default_max_tokens,
+                              server_default_temperature,
+                              server_default_top_p, server_default_seed,
+                              &max_tokens, &max_tokens_set,
+                              &temperature, &top_p);
+            if (!server_call_begin(&server_call)) {
+                free(next_ids);
+                goto chat_done;
+            }
+            output = server_call.output;
+            stop_generation = 0;
+            inference_start = now_s();
+            if (dsv4_prefill(m, next_ids, next_count, 0, logits) != 0) {
+                free(next_ids);
+                goto chat_done;
+            }
+            memcpy(history, next_ids, (size_t)next_count * sizeof(int));
+            history_len = next_count;
+            committed = next_count;
+            prefill_tokens = next_count;
+            fprintf(stderr, "prompt: %d tokens\n", next_count);
+            free(next_ids);
+            continue;
+        }
 
         if (!interactive) break;
         int *turn_ids = NULL;
@@ -1362,6 +2090,8 @@ chat_done:
     free(spec_capture);
     dsv4_context_snapshot_free(ngram_snapshot);
     free(ngram_logits);
+    server_call_dispose(&server_call);
+    if (server_fd >= 0) close(server_fd);
     dsv4_model_close(m);
     free(ptext);
     free(ids);

@@ -2,6 +2,7 @@
 
 <p align="center">
   <strong>在笔记本单颗 CPU 上本地运行 DeepSeek-V4-Flash-0731 原生权重。</strong><br>
+  既可以在终端聊天，也可以通过模型常驻的本地 OpenAI 兼容接口接入应用。<br>
   一个用纯 C 语言（C99）编写的本地大模型 MoE 推理引擎，无需 GPU、CUDA、PyTorch，也无需转换权重。
 </p>
 
@@ -22,6 +23,7 @@
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a><br>
   <a href="#快速开始"><strong>快速开始</strong></a> ·
+  <a href="#本地-api">本地 API</a> ·
   <a href="#实测性能">实测性能</a> ·
   <a href="#我们项目所实现的推理优化">推理优化</a>
 </p>
@@ -86,6 +88,26 @@ bin/dsv4 --model "$HOME/model/DeepSeek-V4-Flash-0731" --interactive
 # 查看采样、思考模式、系统提示词等全部选项
 bin/dsv4 --help
 ```
+
+### 本地 API
+
+让模型和专家缓存保持加载，并启动一个仅限本机访问的 OpenAI 兼容接口：
+
+```bash
+scripts/try-dsv4.sh --server 8080
+```
+
+在另一个终端或本地应用中调用：
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash-0731-in-c","messages":[{"role":"user","content":"科技的边界在哪里？"}],"stream":true}'
+```
+
+接口地址填写 `http://127.0.0.1:8080/v1`，无需 API Key。每次请求都提交完整
+对话，但 167 GB 权重和运行时缓存会一直保持加载。支持的参数、流式调用方式和
+当前限制见[本地 API](docs/API.zh-CN.md)。
 
 ## 环境要求
 
@@ -192,6 +214,9 @@ token 完全一致。长 prefill 的双缓冲调整也做了冷页对照：17-to
 - **跨轮次复用。** 常驻聊天保留模型、KV/compressor、专家缓存和热权重，下一轮
   只处理新增输入；`/reset`、中止当前回答和继续聊天都不需要重新加载 167 GB
   权重。
+- **原生常驻聊天接口。** 多个无状态 Chat Completions 请求复用同一个模型和专家
+  缓存；根据 `messages` 重建 DeepSeek 官方角色与 EOS 序列，并由原生 C 代码
+  流式发送 UTF-8 安全的 SSE token，无需 Python 服务或外部推理框架。
 
 ## 推理正确性
 

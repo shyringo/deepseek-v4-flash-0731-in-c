@@ -3,6 +3,7 @@
 #
 #   scripts/try-dsv4.sh                    # resident interactive chat
 #   scripts/try-dsv4.sh "your prompt here" # one-shot response
+#   scripts/try-dsv4.sh --server 8080      # resident local HTTP API
 #
 # Detects usable RAM and logical CPU count. The default total-memory plan uses
 # the smaller of 2/3 total RAM and 3/4 currently available RAM, rounded down,
@@ -109,7 +110,15 @@ fi
 ARGS+=(--threads "$THREADS")
 if [ -n "$CONTEXT" ]; then ARGS+=(--context "$CONTEXT"); fi
 
-if [ "$#" -ge 1 ]; then
+if [ "${1:-}" = "--server" ]; then
+    if [ "$#" -lt 2 ]; then
+        echo "[try-dsv4] --server needs a port" >&2
+        exit 2
+    fi
+    ARGS+=(--server "$2")
+    shift 2
+    ARGS+=("$@")
+elif [ "$#" -ge 1 ]; then
     ARGS+=(--prompt "$1")
 else
     ARGS+=(--interactive)

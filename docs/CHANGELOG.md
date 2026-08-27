@@ -2,6 +2,24 @@
 
 All notable changes to this project.
 
+## [0.2.0]
+
+### Added
+- Loopback-only OpenAI-compatible Chat Completions server that keeps the model,
+  hot weights, expert cache, tokenizer and worker pools resident.
+- Non-streaming JSON responses and live UTF-8-safe SSE token chunks with
+  optional final usage data.
+- Bounded request parsing, complete message-history reconstruction using the
+  official DeepSeek role/EOS sequence, and explicit API limits.
+- HTTP/JSON/template tests in GNU make, CMake/CTest, strict, portable and
+  sanitizer configurations.
+
+### Changed
+- Token output now uses one sink abstraction shared by terminal, buffered HTTP
+  and SSE paths without changing sampling or model execution.
+- `scripts/try-dsv4.sh --server PORT` applies the same automatic laptop memory,
+  context, thread and I/O planning as terminal chat.
+
 ## [0.1.0]
 
 Initial port from the upstream kimi-k3-in-c baseline

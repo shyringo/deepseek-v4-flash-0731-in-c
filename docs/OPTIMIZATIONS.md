@@ -33,7 +33,7 @@ copyright and licensing.
 
 ## 3. Original engineering mechanisms in this project
 
-These 15 entries are the complete top-level list relative to the
+These 16 entries are the complete top-level list relative to the
 kimi-k3-in-c baseline. Each entry contains several lower-level operators or
 scheduling details.
 
@@ -87,6 +87,10 @@ scheduling details.
 15. **Cross-turn reuse:** retain model, KV/compressor, expert cache and hot
     weights across chat turns, process only new input, stream tokens immediately,
     and avoid reloading weights after cancellation or `/reset`.
+16. **Native resident chat API:** retain the checkpoint, hot weights, expert
+    cache, tokenizer and worker pools across stateless Chat Completions
+    requests; reconstruct the official role/EOS token sequence from complete
+    message history and emit UTF-8-safe SSE deltas without another runtime.
 
 Primary implementation locations: model scheduling, I/O, caching and
 speculative verification are in
@@ -96,10 +100,13 @@ kernels are in [`src/dsv4/dsv4_ops.c`](../src/dsv4/dsv4_ops.c); resource
 planning is in [`src/dsv4/dsv4_config.c`](../src/dsv4/dsv4_config.c) and
 [`scripts/try-dsv4.sh`](../scripts/try-dsv4.sh); resident chat, speculation and
 streaming output are in [`src/cli/dsv4_run.c`](../src/cli/dsv4_run.c).
-Byte-exact coverage is in
+Bounded JSON parsing, message reconstruction and UTF-8 boundary handling are in
+[`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c). Numerical and transport tests
+are in
 [`tests/unit/test_dsv4_ops.c`](../tests/unit/test_dsv4_ops.c),
 [`tests/unit/test_dsv4_model.c`](../tests/unit/test_dsv4_model.c) and
-[`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c).
+[`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c), plus
+[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c).
 
 ## Terminology and evidence
 

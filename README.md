@@ -2,6 +2,7 @@
 
 <p align="center">
   <strong>Run the native DeepSeek-V4-Flash-0731 checkpoint locally on a single laptop CPU.</strong><br>
+  Chat in the terminal or connect apps through a resident local OpenAI-compatible API.<br>
   A pure C local LLM and MoE inference engine, written in portable C99, with no GPU, CUDA, PyTorch or weight conversion.
 </p>
 
@@ -22,6 +23,7 @@
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a><br>
   <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="#local-api">Local API</a> ·
   <a href="#measured-performance">Performance</a> ·
   <a href="#inference-optimizations-implemented-in-this-project">Inference optimizations</a>
 </p>
@@ -88,6 +90,28 @@ bin/dsv4 --model "$HOME/model/DeepSeek-V4-Flash-0731" --interactive
 # Show sampling, thinking, system-prompt and all other options
 bin/dsv4 --help
 ```
+
+### Local API
+
+Keep the model and expert cache loaded behind a loopback-only
+OpenAI-compatible endpoint:
+
+```bash
+scripts/try-dsv4.sh --server 8080
+```
+
+Then call it from another terminal or a local app:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash-0731-in-c","messages":[{"role":"user","content":"Where are the boundaries of technology?"}],"stream":true}'
+```
+
+Use `http://127.0.0.1:8080/v1` as the base URL; no API key is required. Each
+request supplies its complete conversation, while the 167 GB checkpoint and
+runtime caches remain resident. See [Local API](docs/API.md) for supported
+fields, streaming usage and current limits.
 
 ## Requirements
 
@@ -209,6 +233,10 @@ listed below.
 - **Cross-turn reuse.** Keep the model, KV/compressor state, expert cache and hot
   weights resident across chat turns, so `/reset`, cancellation and the next
   message never reload the 167 GB checkpoint.
+- **Native resident chat API.** Reuse the same model and expert cache across
+  stateless Chat Completions requests, rebuild the official DeepSeek role/EOS
+  sequence from `messages`, and stream UTF-8-safe SSE token deltas from native C
+  without a Python service or external inference runtime.
 
 ## Inference Correctness
 

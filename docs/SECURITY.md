@@ -15,6 +15,10 @@ checkpoint-contained Python code, and it never does: `config.json`,
   read-only layer ranges; streamed expert reads remain explicitly bounded.
 - The tokenizer loader checks numeric ids, added-token fields and merge entries;
   the JSON parser caps nesting depth to stop hostile recursion.
+- The local API binds only to `127.0.0.1`, caps headers, request bodies, decoded
+  text and message count, rejects chunked uploads, and resets model state before
+  each request. It does not provide authentication or TLS and must not be
+  exposed through a public reverse proxy without adding those controls.
 
 ## Reporting
 

@@ -30,7 +30,7 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
 
 ## 3. 本项目原创工程机制
 
-下面 15 项是相对 kimi-k3-in-c 基线新设计并实现的机制，也是 README 中“原创
+下面 16 项是相对 kimi-k3-in-c 基线新设计并实现的机制，也是 README 中“原创
 优化”的完整一级清单。每一项下面仍包含多个算子或调度细节。
 
 1. **分层批处理（Layer-major batching）**：一层权重只加载一次，按原顺序推进
@@ -72,6 +72,9 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
     `wo_a` 常驻层、专家 slots、计算线程和读取 workers，并预留系统回收空间。
 15. **跨轮次复用**：常驻 chat 保留模型、KV/compressor、专家缓存和热权重，只
     处理新增输入；token 立即写到 stdout，中止回答或 `/reset` 都不重新加载权重。
+16. **原生常驻聊天接口**：无状态 Chat Completions 请求复用 checkpoint、热权重、
+    专家缓存、tokenizer 和 worker pools；根据完整消息历史重建官方角色/EOS token
+    序列，并直接输出 UTF-8 安全的 SSE delta，不依赖其他推理运行时。
 
 主要实现位置：模型调度、I/O、缓存和投机验证位于
 [`src/dsv4/dsv4_model.c`](../src/dsv4/dsv4_model.c) 与
@@ -79,10 +82,12 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
 [`src/dsv4/dsv4_ops.c`](../src/dsv4/dsv4_ops.c)；资源规划位于
 [`src/dsv4/dsv4_config.c`](../src/dsv4/dsv4_config.c) 和
 [`scripts/try-dsv4.sh`](../scripts/try-dsv4.sh)；常驻对话、投机调度与流式输出位于
-[`src/cli/dsv4_run.c`](../src/cli/dsv4_run.c)。对应的逐字节测试位于
+[`src/cli/dsv4_run.c`](../src/cli/dsv4_run.c)；有界 JSON 解析、消息序列重建和
+UTF-8 边界处理位于 [`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c)。相关测试位于
 [`tests/unit/test_dsv4_ops.c`](../tests/unit/test_dsv4_ops.c)、
 [`tests/unit/test_dsv4_model.c`](../tests/unit/test_dsv4_model.c) 和
-[`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c)。
+[`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c)，以及
+[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c)。
 
 ## 术语与证据
 

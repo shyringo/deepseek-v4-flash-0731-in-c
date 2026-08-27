@@ -48,7 +48,7 @@ THREAD_LDFLAGS ?= -pthread
 CFLAGS   ?= -O3 -std=c99 $(WARN) $(ARCH) $(OMP_CFLAGS) $(THREAD_CFLAGS) -ffp-contract=off
 LDFLAGS  ?= -lm $(OMP_LDFLAGS) $(THREAD_LDFLAGS)
 
-INCLUDES := -Iinclude -Iinclude/dsv4 -Ithird_party -Isrc/dsv4 -Isrc/io
+INCLUDES := -Iinclude -Iinclude/dsv4 -Ithird_party -Isrc/dsv4 -Isrc/io -Isrc/cli
 
 # ------------------------------------------------------------------ files --
 ENGINE_SRC := src/dsv4/dsv4_config.c src/dsv4/dsv4_tensor.c \
@@ -56,12 +56,13 @@ ENGINE_SRC := src/dsv4/dsv4_config.c src/dsv4/dsv4_tensor.c \
               src/dsv4/dsv4_prompt.c \
               src/io/k3_st.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
+HTTP_OBJ := $(BUILD)/src/cli/dsv4_http.o
 
 CLI_SRC := src/cli/dsv4_run.c
 CLI_BIN := $(BIN)/dsv4
 
 UNIT_TESTS := test_dsv4_config test_dsv4_ops test_dsv4_prompt test_dsv4_st \
-              test_dsv4_tok test_dsv4_model
+              test_dsv4_tok test_dsv4_model test_dsv4_http
 TEST_BINS  := $(addprefix $(BIN)/,$(UNIT_TESTS))
 
 FIXTURES ?= tests/fixtures
@@ -76,8 +77,8 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
-	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+$(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) $(HTTP_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) $(HTTP_OBJ) -o $@ $(LDFLAGS)
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -108,6 +109,10 @@ $(BIN)/test_dsv4_model: tests/unit/test_dsv4_model.c $(BUILD)/src/dsv4/dsv4_ops.
                         $(BUILD)/src/dsv4/dsv4_model.o $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_dsv4_http: tests/unit/test_dsv4_http.c $(HTTP_OBJ) \
+                       $(BUILD)/src/dsv4/dsv4_prompt.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/bench_dsv4_kernels: benchmarks/bench_dsv4_kernels.c $(BUILD)/src/dsv4/dsv4_ops.o \
                           $(BUILD)/src/dsv4/dsv4_model.o $(BUILD)/src/dsv4/dsv4_config.o \
                           $(BUILD)/src/dsv4/dsv4_tensor.o $(BUILD)/src/io/k3_st.o | $(BIN)
@@ -121,6 +126,7 @@ test: $(TEST_BINS)
 	@echo "== safetensors reader ==";  ./$(BIN)/test_dsv4_st $(FIXTURES)/st $(BUILD)/st_index.json
 	@echo "== tokenizer ==";           ./$(BIN)/test_dsv4_tok $(MODEL)
 	@echo "== tiny-model graph ==";    ./$(BIN)/test_dsv4_model $(FIXTURES)/tiny_dsv4
+	@echo "== HTTP/JSON ==";           ./$(BIN)/test_dsv4_http
 	@echo
 	@echo "ALL WEIGHTLESS TESTS PASSED"
 

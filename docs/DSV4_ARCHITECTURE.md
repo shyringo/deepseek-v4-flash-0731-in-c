@@ -202,6 +202,19 @@ cap ended before one, and the next user/assistant role suffix. It then calls
 transcript. The tiny suite verifies that split resident prefill is bit-identical
 to one contiguous prefill.
 
+`--server PORT` uses a stateless variant of the same resident runtime. It binds
+only to `127.0.0.1`, keeps the checkpoint mapping, decoded `wo_a` prefix,
+expert cache, tokenizer and worker pools alive, and resets only model context
+and sampling state between requests. The request's complete `messages` array is
+rebuilt as the official BOS/system/user/assistant/EOS token sequence before one
+layer-major prefill, so hidden state cannot leak from an earlier request.
+
+Streaming requests receive standard Chat Completions SSE chunks. A small
+boundary buffer joins token bytes that split a multibyte character before JSON
+encoding, keeping CJK text and emoji valid UTF-8. The server handles one request
+at a time because concurrent generations would need independent multi-gigabyte
+context and expert-cache state on a laptop.
+
 ## Prompt-lookup speculative verification
 
 Before an ordinary decode step, the CLI searches the committed token history
