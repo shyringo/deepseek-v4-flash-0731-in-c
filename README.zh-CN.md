@@ -63,6 +63,10 @@ scripts/try-dsv4.sh
 大小、线程数和读盘方式。输入 `/reset` 开始新会话，按 `Ctrl-C` 停止当前回答
 但保留模型，输入 `/exit` 退出。
 
+<p align="center">
+  <img src="docs/assets/terminal-demo.png" alt="原生 C 推理引擎在笔记本 CPU 上生成的真实 DeepSeek-V4-Flash-0731 示例输出">
+</p>
+
 常用的其他推理方式：
 
 ```bash
