@@ -64,14 +64,69 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 Every event uses the same completion ID and creation time. The stream sends an
 assistant-role chunk, UTF-8-safe content deltas, a final `finish_reason`, an
-optional usage chunk, and `data: [DONE]`.
+optional usage chunk, and `data: [DONE]`. Tool-capable streams send an SSE
+keep-alive comment every 10 seconds during long prefill/generation, then emit a
+complete validated `delta.tool_calls` entry.
+
+## Function tools
+
+Function tools work in non-thinking server mode with `tool_choice: "auto"` or
+`"none"`. The engine renders the DeepSeek-V4 DSML contract, validates that the
+model called a function declared by the request, and returns ordinary OpenAI
+`tool_calls` objects. It does not execute the function.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-flash-0731-in-c",
+    "messages": [{"role": "user", "content": "What is 17 plus 25? Use the tool."}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "add_numbers",
+        "description": "Add two numbers",
+        "parameters": {
+          "type": "object",
+          "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+          "required": ["a", "b"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "temperature": 0
+  }'
+```
+
+A successful call has `finish_reason: "tool_calls"` and arguments such as
+`{"a":17,"b":25}`. Send the returned assistant message back in `messages`,
+then append one `tool` message for every call:
+
+```json
+{"role":"tool","tool_call_id":"CALL_ID_FROM_RESPONSE","content":"42"}
+```
+
+Parallel calls are supported. Every returned call ID must receive exactly one
+result; unknown, duplicate, or missing IDs are rejected before model execution.
+The full checkpoint was verified with string and numeric arguments, two
+parallel calls, a complete result round trip, SSE, and the official OpenAI
+JavaScript SDK.
+
+DeepSeek-V4-Flash-0731 can emit a small set of malformed DSML closing or short
+tag variants without grammar-constrained decoding. The parser recovers only
+observed unambiguous forms after a declared function name and complete
+parameters; ambiguous, truncated, undeclared, duplicate, or invalid-JSON calls
+fail closed.
 
 ## Supported request fields
 
 - `model`: `deepseek-v4-flash-0731-in-c` or `deepseek-v4-flash-0731`.
-- `messages`: up to 128 string-content messages. `system` and `developer`
-  messages may appear at the beginning; the remaining messages alternate
-  `user` and `assistant`, ending with `user`.
+- `messages`: up to 128 messages. Initial `system` / `developer` instructions,
+  ordinary `user` / `assistant` history, assistant `tool_calls`, and matched
+  `tool` results are supported.
+- `tools`: up to 64 function definitions. Function names must be unique.
+- `tool_choice`: omitted / `auto`, or `none`. `required` and named forced
+  choices are rejected.
 - `max_tokens` or `max_completion_tokens`: 1 through 65,536. The server default
   is 1,024 unless `--max-tokens` changes it at startup.
 - `temperature`: 0 through 2.
@@ -90,7 +145,9 @@ context and RNG state are reset before the request is evaluated.
 ## Current scope
 
 The server is intended for one laptop user and processes one request at a time.
-Tools, tool choice, structured output, multimodal content, authentication, TLS,
-and remote-network listening are not implemented. Unsupported features return
-a clear error rather than being silently ignored. Request bodies are limited to
-1 MiB and decoded message text to 256 KiB.
+Tool calling currently requires non-thinking server mode; `strict: true`
+schemas are rejected because this release does not implement full JSON Schema
+constrained decoding. Structured output, multimodal content, authentication,
+TLS, and remote-network listening are not implemented. Unsupported features
+return a clear error rather than being silently ignored. Request bodies are
+limited to 1 MiB and decoded message text to 256 KiB.

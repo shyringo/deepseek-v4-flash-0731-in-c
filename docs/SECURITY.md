@@ -19,6 +19,11 @@ checkpoint-contained Python code, and it never does: `config.json`,
   text and message count, rejects chunked uploads, and resets model state before
   each request. It does not provide authentication or TLS and must not be
   exposed through a public reverse proxy without adding those controls.
+- Tool schemas and results are untrusted request data. The engine never runs a
+  tool: it validates and returns declared function names plus JSON arguments,
+  and requires matched result IDs on the next request. The calling application
+  must still validate arguments against its own schema and authorize every
+  side effect before execution.
 
 ## Reporting
 

@@ -3,6 +3,7 @@
 #include "dsv4.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,16 @@ void dsv4_http_chat_request_free(DSV4HttpChatRequest *request)
     for (size_t i = 0; i < request->message_count; ++i) {
         free(request->messages[i].role);
         free(request->messages[i].content);
+        free(request->messages[i].tool_call_id);
+        for (size_t j = 0; j < request->messages[i].tool_call_count; ++j) {
+            free(request->messages[i].tool_calls[j].id);
+            free(request->messages[i].tool_calls[j].name);
+            free(request->messages[i].tool_calls[j].arguments);
+        }
+    }
+    for (size_t i = 0; i < request->tool_count; ++i) {
+        free(request->tools[i].name);
+        free(request->tools[i].function_json);
     }
     memset(request, 0, sizeof(*request));
 }
@@ -211,6 +222,147 @@ static int dsv4_append_system(DSV4Buffer *system, const char *text)
            dsv4_buffer_append_string(system, text);
 }
 
+static int dsv4_tool_name_valid(const char *name)
+{
+    const size_t length = name ? strlen(name) : 0u;
+    if (!length || length > 128u) return 0;
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char c = (unsigned char)name[i];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '.' || c == ':'))
+            return 0;
+    }
+    return 1;
+}
+
+static int dsv4_json_token_next(const jsmntok_t *tokens, int count, int index)
+{
+    if (index < 0 || index >= count) return count;
+    const int end = tokens[index].end;
+    ++index;
+    while (index < count && tokens[index].start < end) ++index;
+    return index;
+}
+
+static char *dsv4_decode_string(const char *json, const jsmntok_t *token);
+
+static int dsv4_append_history_calls(DSV4Buffer *prompt,
+                                     const DSV4HttpMessage *message,
+                                     char *error, size_t error_capacity)
+{
+    if (!dsv4_buffer_append_string(prompt, "\n\n<｜DSML｜tool_calls>\n"))
+        return 0;
+    for (size_t i = 0; i < message->tool_call_count; ++i) {
+        const DSV4HttpToolCall *call = &message->tool_calls[i];
+        if (!dsv4_tool_name_valid(call->name)) {
+            dsv4_http_error(error, error_capacity,
+                            "invalid tool name in assistant history");
+            return 0;
+        }
+        if (!dsv4_buffer_append_string(prompt, "<｜DSML｜invoke name=\"") ||
+            !dsv4_buffer_append_string(prompt, call->name) ||
+            !dsv4_buffer_append_string(prompt, "\">\n"))
+            return 0;
+        jsmn_parser parser;
+        jsmntok_t tokens[512];
+        jsmn_init(&parser);
+        const size_t arguments_length = strlen(call->arguments);
+        const int count = jsmn_parse(&parser, call->arguments,
+                                     arguments_length, tokens,
+                                     sizeof(tokens) / sizeof(tokens[0]));
+        if (count < 1 || tokens[0].type != JSMN_OBJECT ||
+            tokens[0].start != 0 || tokens[0].end != (int)arguments_length) {
+            dsv4_http_error(error, error_capacity,
+                            "tool_call arguments must be one JSON object");
+            return 0;
+        }
+        int index = 1;
+        while (index < count && tokens[index].start < tokens[0].end) {
+            const int value = index + 1;
+            if (value >= count || tokens[index].type != JSMN_STRING ||
+                tokens[value].start >= tokens[0].end) {
+                dsv4_http_error(error, error_capacity,
+                                "invalid tool_call arguments object");
+                return 0;
+            }
+            char *name = dsv4_decode_string(call->arguments, &tokens[index]);
+            if (!dsv4_tool_name_valid(name)) {
+                free(name);
+                dsv4_http_error(error, error_capacity,
+                                "invalid tool parameter name");
+                return 0;
+            }
+            const int is_string = tokens[value].type == JSMN_STRING;
+            char *string_value = is_string
+                               ? dsv4_decode_string(call->arguments,
+                                                    &tokens[value]) : NULL;
+            int ok = dsv4_buffer_append_string(
+                         prompt, "<｜DSML｜parameter name=\"") &&
+                     dsv4_buffer_append_string(prompt, name) &&
+                     dsv4_buffer_append_string(
+                         prompt, is_string
+                             ? "\" string=\"true\">"
+                             : "\" string=\"false\">");
+            free(name);
+            if (ok && is_string) ok = string_value &&
+                dsv4_buffer_append_string(prompt, string_value);
+            else if (ok) ok = dsv4_buffer_append(
+                prompt, call->arguments + tokens[value].start,
+                (size_t)(tokens[value].end - tokens[value].start));
+            free(string_value);
+            if (!ok || !dsv4_buffer_append_string(
+                    prompt, "</｜DSML｜parameter>\n"))
+                return 0;
+            index = dsv4_json_token_next(tokens, count, value);
+        }
+        if (!dsv4_buffer_append_string(prompt, "</｜DSML｜invoke>\n"))
+            return 0;
+    }
+    return dsv4_buffer_append_string(prompt, "</｜DSML｜tool_calls>");
+}
+
+static int dsv4_append_tools_system(DSV4Buffer *system,
+                                    const DSV4HttpChatRequest *request)
+{
+    static const char header[] =
+        "## Tools\n\n"
+        "You have access to a set of tools to help answer the user's question. "
+        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like "
+        "the following:\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">"
+        "$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. "
+        "For all other types (numbers, booleans, arrays, objects), pass the "
+        "value in JSON format and set `string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output "
+        "your complete reasoning inside <think>...</think> BEFORE any tool "
+        "calls or final response.\n\n"
+        "Otherwise, output directly after </think> with tool calls or final "
+        "response.\n\n"
+        "### Available Tool Schemas\n\n";
+    static const char footer[] =
+        "\nYou MUST strictly follow the above defined tool name and parameter "
+        "schemas to invoke tool calls.\n";
+    if (!request->tool_count || request->tool_choice_none) return 1;
+    if (system->length && !dsv4_buffer_append_string(system, "\n\n")) return 0;
+    if (!dsv4_buffer_append_string(system, header)) return 0;
+    for (size_t i = 0; i < request->tool_count; ++i) {
+        if (!dsv4_tool_name_valid(request->tools[i].name) ||
+            !dsv4_buffer_append_string(system,
+                                       request->tools[i].function_json) ||
+            !dsv4_buffer_append_string(system, "\n"))
+            return 0;
+    }
+    return dsv4_buffer_append_string(system, footer);
+}
+
 char *dsv4_http_render_messages(const DSV4HttpChatRequest *request,
                                 const char *base_system,
                                 const char *reasoning_effort,
@@ -228,70 +380,137 @@ char *dsv4_http_render_messages(const DSV4HttpChatRequest *request,
     int ok = 1;
     if (base_system && *base_system)
         ok = dsv4_append_system(&system, base_system);
-    size_t index = 0;
-    while (ok && index < request->message_count &&
-           (strcmp(request->messages[index].role, "system") == 0 ||
-            strcmp(request->messages[index].role, "developer") == 0)) {
-        ok = dsv4_append_system(&system, request->messages[index].content);
-        ++index;
+    size_t instruction_end = 0;
+    while (instruction_end < request->message_count &&
+           (strcmp(request->messages[instruction_end].role, "system") == 0 ||
+            strcmp(request->messages[instruction_end].role, "developer") == 0)) {
+        if (ok) ok = dsv4_append_system(
+            &system, request->messages[instruction_end].content);
+        ++instruction_end;
     }
+    if (ok) ok = dsv4_append_tools_system(&system, request);
     int first = 1;
-    while (ok && index < request->message_count) {
-        const DSV4HttpMessage *user = &request->messages[index];
-        if (strcmp(user->role, "user") != 0) {
+    int assistant_open = 0;
+    int tool_results = 0;
+    const DSV4HttpMessage *tool_source = NULL;
+    int tool_result_seen[DSV4_HTTP_MAX_TOOL_CALLS] = {0};
+    for (size_t index = 0; ok && index < request->message_count; ++index) {
+        const DSV4HttpMessage *message = &request->messages[index];
+        if (index < instruction_end) continue;
+        if (strcmp(message->role, "system") == 0) {
             dsv4_http_error(error, error_capacity,
-                            "messages must alternate user and assistant roles");
+                            "system messages must appear first");
             ok = 0;
             break;
         }
-        const int needed = first
-            ? dsv4_format_prompt(NULL, 0, user->content,
-                                 system.data ? system.data : "",
-                                 reasoning_effort)
-            : dsv4_format_turn(NULL, 0, user->content, reasoning_effort);
-        if (needed < 0) {
-            dsv4_http_error(error, error_capacity,
-                            "user message content must not be empty");
+        if (strcmp(message->role, "user") == 0 ||
+            strcmp(message->role, "developer") == 0) {
+            if (assistant_open || tool_results || !message->content[0]) {
+                dsv4_http_error(error, error_capacity,
+                                "invalid user/assistant/tool message order");
+                ok = 0;
+                break;
+            }
+            const int needed = first
+                ? dsv4_format_prompt(NULL, 0, message->content,
+                                     system.data ? system.data : "",
+                                     reasoning_effort)
+                : dsv4_format_turn(NULL, 0, message->content,
+                                   reasoning_effort);
+            char *turn = needed >= 0
+                       ? (char *)malloc((size_t)needed + 1u) : NULL;
+            if (!turn) {
+                dsv4_http_error(error, error_capacity,
+                                "out of memory rendering messages");
+                ok = 0;
+                break;
+            }
+            if (first)
+                dsv4_format_prompt(turn, (size_t)needed + 1u,
+                                   message->content,
+                                   system.data ? system.data : "",
+                                   reasoning_effort);
+            else
+                dsv4_format_turn(turn, (size_t)needed + 1u,
+                                 message->content, reasoning_effort);
+            ok = dsv4_buffer_append(&prompt, turn, (size_t)needed);
+            free(turn);
+            first = 0;
+            assistant_open = 1;
+        } else if (strcmp(message->role, "assistant") == 0) {
+            if (!assistant_open ||
+                (!message->content[0] && !message->tool_call_count) ||
+                !eos_text || !*eos_text) {
+                dsv4_http_error(error, error_capacity,
+                                "invalid assistant message position");
+                ok = 0;
+                break;
+            }
+            if (reasoning_effort)
+                ok = dsv4_buffer_append_string(&prompt, "</think>");
+            if (ok && message->content[0])
+                ok = dsv4_buffer_append_string(&prompt, message->content);
+            if (ok && message->tool_call_count)
+                ok = dsv4_append_history_calls(&prompt, message,
+                                                error, error_capacity);
+            if (ok) ok = dsv4_buffer_append_string(&prompt, eos_text);
+            assistant_open = 0;
+            tool_results = message->tool_call_count > 0;
+            tool_source = message->tool_call_count ? message : NULL;
+            memset(tool_result_seen, 0, sizeof(tool_result_seen));
+        } else if (strcmp(message->role, "tool") == 0) {
+            if (assistant_open || !tool_results || !tool_source ||
+                !message->content[0] || !message->tool_call_id) {
+                dsv4_http_error(error, error_capacity,
+                                "tool result does not follow tool_calls");
+                ok = 0;
+                break;
+            }
+            size_t matched = tool_source->tool_call_count;
+            for (size_t i = 0; i < tool_source->tool_call_count; ++i) {
+                if (tool_source->tool_calls[i].id &&
+                    strcmp(tool_source->tool_calls[i].id,
+                           message->tool_call_id) == 0) {
+                    matched = i;
+                    break;
+                }
+            }
+            if (matched == tool_source->tool_call_count ||
+                tool_result_seen[matched]) {
+                dsv4_http_error(error, error_capacity,
+                                "tool_call_id is unknown or duplicated");
+                ok = 0;
+                break;
+            }
+            tool_result_seen[matched] = 1;
+            if (!dsv4_buffer_append_string(
+                    &prompt, tool_results == 1
+                        ? "<｜User｜><tool_result>" : "\n\n<tool_result>") ||
+                !dsv4_buffer_append_string(&prompt, message->content) ||
+                !dsv4_buffer_append_string(&prompt, "</tool_result>"))
+                ok = 0;
+            ++tool_results;
+        } else {
+            dsv4_http_error(error, error_capacity, "unsupported message role");
             ok = 0;
-            break;
         }
-        char *turn = (char *)malloc((size_t)needed + 1u);
-        if (!turn) {
-            dsv4_http_error(error, error_capacity,
-                            "out of memory rendering messages");
-            ok = 0;
-            break;
-        }
-        if (first)
-            dsv4_format_prompt(turn, (size_t)needed + 1u, user->content,
-                               system.data ? system.data : "",
-                               reasoning_effort);
-        else
-            dsv4_format_turn(turn, (size_t)needed + 1u, user->content,
-                             reasoning_effort);
-        ok = dsv4_buffer_append(&prompt, turn, (size_t)needed);
-        free(turn);
-        first = 0;
-        ++index;
-        if (!ok || index == request->message_count) break;
-        const DSV4HttpMessage *assistant = &request->messages[index];
-        if (strcmp(assistant->role, "assistant") != 0 ||
-            !assistant->content[0] || !eos_text || !*eos_text) {
-            dsv4_http_error(error, error_capacity,
-                            "messages must alternate user and assistant roles");
-            ok = 0;
-            break;
-        }
-        ok = dsv4_buffer_append_string(&prompt, assistant->content) &&
-             dsv4_buffer_append_string(&prompt, eos_text);
-        ++index;
     }
-    if (ok && index != request->message_count) ok = 0;
-    if (ok && request->messages[request->message_count - 1u].role &&
-        strcmp(request->messages[request->message_count - 1u].role,
-               "user") != 0) {
+    if (ok && tool_results) {
+        if ((size_t)(tool_results - 1) != tool_source->tool_call_count) {
+            dsv4_http_error(error, error_capacity,
+                            "every tool_call needs exactly one result");
+            ok = 0;
+        }
+    }
+    if (ok && tool_results) {
+        ok = dsv4_buffer_append_string(&prompt, "<｜Assistant｜>") &&
+             dsv4_buffer_append_string(
+                 &prompt, reasoning_effort ? "<think>" : "</think>");
+        assistant_open = 1;
+    }
+    if (ok && !assistant_open) {
         dsv4_http_error(error, error_capacity,
-                        "the final message must have role user");
+                        "the final message must request an assistant response");
         ok = 0;
     }
     dsv4_buffer_free(&system);
@@ -438,6 +657,18 @@ fail:
     return NULL;
 }
 
+static char *dsv4_copy_token_json(const char *json, const jsmntok_t *token)
+{
+    if (!json || !token || token->start < 0 || token->end < token->start)
+        return NULL;
+    const size_t length = (size_t)(token->end - token->start);
+    char *copy = (char *)malloc(length + 1u);
+    if (!copy) return NULL;
+    memcpy(copy, json + token->start, length);
+    copy[length] = '\0';
+    return copy;
+}
+
 static int dsv4_parse_u64(const char *json, const jsmntok_t *token,
                          uint64_t *value)
 {
@@ -487,7 +718,8 @@ static int dsv4_primitive_is(const char *json, const jsmntok_t *token,
 static int dsv4_supported_role(const char *role)
 {
     return strcmp(role, "system") == 0 || strcmp(role, "developer") == 0 ||
-           strcmp(role, "user") == 0 || strcmp(role, "assistant") == 0;
+           strcmp(role, "user") == 0 || strcmp(role, "assistant") == 0 ||
+           strcmp(role, "tool") == 0;
 }
 
 int dsv4_http_parse_chat_request(const char *json, size_t length,
@@ -572,11 +804,79 @@ int dsv4_http_parse_chat_request(const char *json, size_t length,
             goto fail;
         }
     }
-    for (size_t i = 0; i < 3; ++i) {
-        const char *unsupported[] = {"tools", "tool_choice", "response_format"};
-        if (dsv4_object_get(json, tokens, count, 0, unsupported[i]) >= 0) {
-            dsv4_http_error(error, error_capacity, "tools and structured output are not supported");
+    if (dsv4_object_get(json, tokens, count, 0, "response_format") >= 0) {
+        dsv4_http_error(error, error_capacity,
+                        "structured output is not supported");
+        goto fail;
+    }
+    token = dsv4_object_get(json, tokens, count, 0, "tool_choice");
+    if (token >= 0) {
+        if (dsv4_token_equal(json, &tokens[token], "none")) {
+            request->tool_choice_none = 1;
+        } else if (!dsv4_token_equal(json, &tokens[token], "auto")) {
+            dsv4_http_error(error, error_capacity,
+                "tool_choice currently supports only auto or none");
             goto fail;
+        }
+    }
+    const int tools_token = dsv4_object_get(json, tokens, count, 0, "tools");
+    if (tools_token >= 0) {
+        if (tokens[tools_token].type != JSMN_ARRAY) {
+            dsv4_http_error(error, error_capacity, "tools must be a JSON array");
+            goto fail;
+        }
+        int tool_index = tools_token + 1;
+        while (tool_index < count &&
+               tokens[tool_index].start < tokens[tools_token].end) {
+            if (tokens[tool_index].type != JSMN_OBJECT ||
+                request->tool_count >= DSV4_HTTP_MAX_TOOLS) {
+                dsv4_http_error(error, error_capacity,
+                                "tools contains too many or invalid items");
+                goto fail;
+            }
+            const int type = dsv4_object_get(json, tokens, count,
+                                             tool_index, "type");
+            const int function = dsv4_object_get(json, tokens, count,
+                                                 tool_index, "function");
+            if (type < 0 || function < 0 ||
+                !dsv4_token_equal(json, &tokens[type], "function") ||
+                tokens[function].type != JSMN_OBJECT) {
+                dsv4_http_error(error, error_capacity,
+                                "only function tools are supported");
+                goto fail;
+            }
+            const int name = dsv4_object_get(json, tokens, count,
+                                             function, "name");
+            const int strict = dsv4_object_get(json, tokens, count,
+                                               function, "strict");
+            if (strict >= 0 &&
+                !dsv4_primitive_is(json, &tokens[strict], "false")) {
+                dsv4_http_error(error, error_capacity,
+                                "strict function tools are not supported");
+                goto fail;
+            }
+            DSV4HttpTool *tool = &request->tools[request->tool_count];
+            if (name < 0 ||
+                !(tool->name = dsv4_decode_string(json, &tokens[name])) ||
+                !(tool->function_json = dsv4_copy_token_json(
+                    json, &tokens[function]))) {
+                free(tool->name);
+                free(tool->function_json);
+                tool->name = NULL;
+                tool->function_json = NULL;
+                dsv4_http_error(error, error_capacity,
+                                "each function tool needs a name and schema");
+                goto fail;
+            }
+            ++request->tool_count;
+            for (size_t i = 0; i + 1u < request->tool_count; ++i) {
+                if (strcmp(request->tools[i].name, tool->name) == 0) {
+                    dsv4_http_error(error, error_capacity,
+                                    "tool names must be unique");
+                    goto fail;
+                }
+            }
+            tool_index = dsv4_token_next(tokens, count, tool_index);
         }
     }
 
@@ -642,20 +942,26 @@ int dsv4_http_parse_chat_request(const char *json, size_t length,
             goto fail;
         }
         const int role = dsv4_object_get(json, tokens, count, index, "role");
-        const int content = dsv4_object_get(json, tokens, count, index, "content");
+        const int content = dsv4_object_get(json, tokens, count, index,
+                                            "content");
         DSV4HttpMessage *message = &request->messages[request->message_count];
         if (role < 0 || content < 0) {
-            dsv4_http_error(error, error_capacity, "each message needs string role and content");
+            dsv4_http_error(error, error_capacity,
+                            "each message needs role and content");
             goto fail;
         }
         message->role = dsv4_decode_string(json, &tokens[role]);
-        message->content = dsv4_decode_string(json, &tokens[content]);
+        if (tokens[content].type == JSMN_STRING)
+            message->content = dsv4_decode_string(json, &tokens[content]);
+        else if (dsv4_primitive_is(json, &tokens[content], "null"))
+            message->content = (char *)calloc(1u, 1u);
         if (!message->role || !message->content) {
             free(message->role);
             free(message->content);
             message->role = NULL;
             message->content = NULL;
-            dsv4_http_error(error, error_capacity, "each message needs string role and content");
+            dsv4_http_error(error, error_capacity,
+                            "message content must be a string or null");
             goto fail;
         }
         ++request->message_count;
@@ -663,7 +969,92 @@ int dsv4_http_parse_chat_request(const char *json, size_t length,
             dsv4_http_error(error, error_capacity, "unsupported message role");
             goto fail;
         }
-        total_text += strlen(message->role) + strlen(message->content);
+        const int tool_call_id = dsv4_object_get(
+            json, tokens, count, index, "tool_call_id");
+        if (tool_call_id >= 0 &&
+            !(message->tool_call_id = dsv4_decode_string(
+                json, &tokens[tool_call_id]))) {
+            dsv4_http_error(error, error_capacity,
+                            "tool_call_id must be a string");
+            goto fail;
+        }
+        const int calls = dsv4_object_get(json, tokens, count,
+                                          index, "tool_calls");
+        if (calls >= 0) {
+            if (tokens[calls].type != JSMN_ARRAY ||
+                strcmp(message->role, "assistant") != 0) {
+                dsv4_http_error(error, error_capacity,
+                                "tool_calls belongs on an assistant message");
+                goto fail;
+            }
+            int call_index = calls + 1;
+            while (call_index < count &&
+                   tokens[call_index].start < tokens[calls].end) {
+                if (tokens[call_index].type != JSMN_OBJECT ||
+                    message->tool_call_count >= DSV4_HTTP_MAX_TOOL_CALLS) {
+                    dsv4_http_error(error, error_capacity,
+                                    "too many or invalid tool_calls");
+                    goto fail;
+                }
+                const int call_type = dsv4_object_get(
+                    json, tokens, count, call_index, "type");
+                const int call_id = dsv4_object_get(
+                    json, tokens, count, call_index, "id");
+                const int function = dsv4_object_get(
+                    json, tokens, count, call_index, "function");
+                if (call_type < 0 || function < 0 ||
+                    !dsv4_token_equal(json, &tokens[call_type], "function") ||
+                    tokens[function].type != JSMN_OBJECT) {
+                    dsv4_http_error(error, error_capacity,
+                                    "only function tool_calls are supported");
+                    goto fail;
+                }
+                const int call_name = dsv4_object_get(
+                    json, tokens, count, function, "name");
+                const int arguments = dsv4_object_get(
+                    json, tokens, count, function, "arguments");
+                DSV4HttpToolCall *call =
+                    &message->tool_calls[message->tool_call_count];
+                if (call_id >= 0)
+                    call->id = dsv4_decode_string(json, &tokens[call_id]);
+                call->name = call_name >= 0
+                           ? dsv4_decode_string(json, &tokens[call_name]) : NULL;
+                call->arguments = arguments >= 0
+                                ? dsv4_decode_string(json, &tokens[arguments])
+                                : NULL;
+                if ((call_id >= 0 && !call->id) ||
+                    !call->name || !call->arguments) {
+                    free(call->id);
+                    free(call->name);
+                    free(call->arguments);
+                    call->id = NULL;
+                    call->name = NULL;
+                    call->arguments = NULL;
+                    dsv4_http_error(error, error_capacity,
+                                    "invalid function tool_call");
+                    goto fail;
+                }
+                ++message->tool_call_count;
+                call_index = dsv4_token_next(tokens, count, call_index);
+            }
+        }
+        if (strcmp(message->role, "tool") == 0 &&
+            (!message->tool_call_id || !message->content[0])) {
+            dsv4_http_error(error, error_capacity,
+                            "tool messages need tool_call_id and content");
+            goto fail;
+        }
+        if (message->tool_call_count && !request->tool_count) {
+            dsv4_http_error(error, error_capacity,
+                            "tool_calls history requires tools");
+            goto fail;
+        }
+        total_text += strlen(message->role) + strlen(message->content) +
+                      (message->tool_call_id
+                           ? strlen(message->tool_call_id) : 0u);
+        for (size_t i = 0; i < message->tool_call_count; ++i)
+            total_text += strlen(message->tool_calls[i].name) +
+                          strlen(message->tool_calls[i].arguments);
         if (total_text > DSV4_HTTP_MAX_TEXT) {
             dsv4_http_error(error, error_capacity, "decoded message text is too large");
             goto fail;

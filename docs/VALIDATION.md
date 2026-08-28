@@ -147,6 +147,44 @@ s/token TPOT over 63 intervals. It begins with the fixed 16-token oracle above.
 A preceding memory-only A/B reproduced the same output IDs at 9, 12, 15 and 18
 GiB. The fixed 16-token sequence remains the correctness oracle.
 
+## Function-tool validation
+
+The v0.3 tool path was tested against the same pinned full checkpoint with an
+18 GiB plan, 4,096-token context, 12 threads, greedy sampling and non-thinking
+mode. These are protocol/correctness checks, not performance records:
+
+1. A `get_weather(city: string)` request returned
+   `finish_reason=tool_calls`, a unique call ID, function `get_weather`, and
+   arguments `{"city":"Beijing"}`.
+2. Replaying that assistant message plus the matching tool result
+   `25 C / sunny` produced a final answer using both values and
+   `finish_reason=stop`.
+3. An `add_numbers(a: number, b: number)` request preserved numeric JSON types:
+   `{"a":17,"b":25}`. Whitespace before the DSML block became `content=null`.
+4. A two-city request produced two uniquely identified parallel
+   `get_weather` calls for Beijing and Shanghai. Replaying both matched results
+   produced a comparison containing both supplied temperatures and conditions.
+5. A tool-capable SSE request stayed connected for 488 seconds through 48
+   keep-alive comments, then returned one completion ID, a standard
+   `delta.tool_calls`, `finish_reason=tool_calls`, usage, and `[DONE]`.
+6. `openai` JavaScript SDK 6.15.0 consumed the SSE endpoint directly and
+   reconstructed `add_numbers` plus `{"a":17,"b":25}` without a custom stream
+   parser.
+
+The unconstrained checkpoint emitted several deterministic but unambiguous
+DSML variations across these prompts: shortened closing tags, one duplicated
+`invoke` keyword, and short `invoke` / `parameter` tags. Fixtures preserve the
+exact observed strings. Recovery is limited to a standard outer
+`<｜DSML｜tool_calls>` block with a declared function, complete parameters and
+valid JSON values. Unknown functions, ambiguous text, incomplete parameters,
+duplicate names/results, missing results and invalid JSON fail closed.
+
+Weightless tests exercise standard and observed DSML forms at every input
+chunk size, string/numeric/boolean/array/object values, parallel calls,
+angle-bracket values, UTF-8, tool-history reconstruction, and negative paths.
+The complete strict, portable, ASan/UBSan and CMake/CTest suites pass, while the
+four-layer model remains `maxdiff=0.000000`.
+
 ## What this does NOT claim
 
 Without a compatible official CUDA/TileLang oracle, full-model **logit-level

@@ -80,6 +80,56 @@ int main(void)
     free(rendered);
     dsv4_http_chat_request_free(&request);
 
+    static const char tools_disabled[] =
+        "{\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"parameters\":{\"type\":\"object\"}}}],"
+        "\"tool_choice\":\"none\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"answer directly\"}]}";
+    CHECK(dsv4_http_parse_chat_request(
+        tools_disabled, strlen(tools_disabled),
+        &request, error, sizeof(error)));
+    CHECK(request.tool_choice_none);
+    rendered = dsv4_http_render_messages(
+        &request, NULL, NULL, "<EOS>", error, sizeof(error));
+    CHECK(rendered != NULL && strstr(rendered, "## Tools") == NULL);
+    free(rendered);
+    dsv4_http_chat_request_free(&request);
+
+    static const char missing_tool_result[] =
+        "{\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"parameters\":{\"type\":\"object\"}}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"go\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{"
+        "\"id\":\"call_x\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"arguments\":\"{}\"}}]}]}";
+    CHECK(dsv4_http_parse_chat_request(
+        missing_tool_result, strlen(missing_tool_result),
+        &request, error, sizeof(error)));
+    rendered = dsv4_http_render_messages(
+        &request, NULL, NULL, "<EOS>", error, sizeof(error));
+    CHECK(rendered == NULL && strstr(error, "exactly one result") != NULL);
+    dsv4_http_chat_request_free(&request);
+
+    static const char duplicate_tool_result[] =
+        "{\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"parameters\":{\"type\":\"object\"}}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"go\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{"
+        "\"id\":\"call_x\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"arguments\":\"{}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_x\",\"content\":\"1\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_x\",\"content\":\"2\"}]}";
+    CHECK(dsv4_http_parse_chat_request(
+        duplicate_tool_result, strlen(duplicate_tool_result),
+        &request, error, sizeof(error)));
+    rendered = dsv4_http_render_messages(
+        &request, NULL, NULL, "<EOS>", error, sizeof(error));
+    CHECK(rendered == NULL && strstr(error, "duplicated") != NULL);
+    dsv4_http_chat_request_free(&request);
+
     static const char bad_history[] =
         "{\"model\":\"deepseek-v4-flash-0731-in-c\",\"messages\":["
         "{\"role\":\"user\",\"content\":\"one\"},"
@@ -88,7 +138,48 @@ int main(void)
                                        &request, error, sizeof(error)));
     rendered = dsv4_http_render_messages(
         &request, NULL, NULL, "<EOS>", error, sizeof(error));
-    CHECK(rendered == NULL && strstr(error, "alternate") != NULL);
+    CHECK(rendered == NULL && strstr(error, "order") != NULL);
+    dsv4_http_chat_request_free(&request);
+
+    static const char tool_history[] =
+        "{\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"get_weather\",\"description\":\"Get weather\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"city\":{\"type\":\"string\"},"
+        "\"days\":{\"type\":\"integer\"}}}}}],"
+        "\"tool_choice\":\"auto\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"weather\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{"
+        "\"id\":\"call_1\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"get_weather\","
+        "\"arguments\":\"{\\\"city\\\":\\\"北京\\\",\\\"days\\\":3}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\","
+        "\"content\":\"sunny\"}]}";
+    CHECK(dsv4_http_parse_chat_request(tool_history, strlen(tool_history),
+                                       &request, error, sizeof(error)));
+    CHECK(request.tool_count == 1u);
+    CHECK(strcmp(request.tools[0].name, "get_weather") == 0);
+    CHECK(request.messages[1].tool_call_count == 1u);
+    CHECK(strcmp(request.messages[1].tool_calls[0].arguments,
+                 "{\"city\":\"北京\",\"days\":3}") == 0);
+    rendered = dsv4_http_render_messages(
+        &request, NULL, NULL, "<EOS>", error, sizeof(error));
+    CHECK(rendered != NULL);
+    CHECK(strstr(rendered, "## Tools") != NULL);
+    CHECK(strstr(rendered, "\"name\":\"get_weather\"") != NULL);
+    CHECK(strstr(rendered,
+        "<｜DSML｜invoke name=\"get_weather\">") != NULL);
+    CHECK(strstr(rendered,
+        "<｜DSML｜parameter name=\"city\" string=\"true\">北京"
+        "</｜DSML｜parameter>") != NULL);
+    CHECK(strstr(rendered,
+        "<｜DSML｜parameter name=\"days\" string=\"false\">3"
+        "</｜DSML｜parameter>") != NULL);
+    CHECK(strstr(rendered,
+        "<EOS><｜User｜><tool_result>sunny</tool_result>"
+        "<｜Assistant｜></think>") != NULL);
+    free(rendered);
     dsv4_http_chat_request_free(&request);
 
     CHECK(expect_error(
@@ -99,16 +190,26 @@ int main(void)
         "requires stream"));
     CHECK(expect_error(
         "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}]}",
-        "string role and content"));
+        "content must"));
     CHECK(expect_error(
         "{\"model\":\"x\",\"messages\":[{\"role\":\"tool\",\"content\":\"x\"}]}",
-        "unsupported message role"));
+        "tool messages"));
     CHECK(expect_error(
         "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"\\ud83dX\"}]}",
-        "string role and content"));
+        "content must"));
     CHECK(expect_error(
         "{\"model\":\"x\",\"messages\":[],\"tools\":[]}",
-        "tools"));
+        "must not be empty"));
+    CHECK(expect_error(
+        "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],"
+        "\"tool_choice\":\"required\"}",
+        "only auto or none"));
+    CHECK(expect_error(
+        "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"x\",\"strict\":true,"
+        "\"parameters\":{\"type\":\"object\"}}}]}",
+        "strict function"));
     CHECK(expect_error("{\"model\":\"x\",\"messages\":[]}",
                        "must not be empty"));
     CHECK(expect_error("[]", "one valid JSON object"));

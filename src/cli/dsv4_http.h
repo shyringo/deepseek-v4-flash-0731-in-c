@@ -6,18 +6,37 @@
 #include <stdint.h>
 
 #define DSV4_HTTP_MAX_MESSAGES 128u
+#define DSV4_HTTP_MAX_TOOLS 64u
+#define DSV4_HTTP_MAX_TOOL_CALLS 16u
 #define DSV4_HTTP_MAX_BODY (1024u * 1024u)
 #define DSV4_HTTP_MAX_TEXT (256u * 1024u)
 
 typedef struct {
+    char *id;
+    char *name;
+    char *arguments;
+} DSV4HttpToolCall;
+
+typedef struct {
     char *role;
     char *content;
+    char *tool_call_id;
+    DSV4HttpToolCall tool_calls[DSV4_HTTP_MAX_TOOL_CALLS];
+    size_t tool_call_count;
 } DSV4HttpMessage;
+
+typedef struct {
+    char *name;
+    char *function_json;
+} DSV4HttpTool;
 
 typedef struct {
     char *model;
     DSV4HttpMessage messages[DSV4_HTTP_MAX_MESSAGES];
     size_t message_count;
+    DSV4HttpTool tools[DSV4_HTTP_MAX_TOOLS];
+    size_t tool_count;
+    int tool_choice_none;
     uint32_t max_tokens;
     uint64_t seed;
     float temperature;

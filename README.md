@@ -110,7 +110,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Use `http://127.0.0.1:8080/v1` as the base URL; no API key is required. Each
 request supplies its complete conversation, while the 167 GB checkpoint and
-runtime caches remain resident. See [Local API](docs/API.md) for supported
+runtime caches remain resident. The API also supports validated function-tool
+calls and parallel tool results. See [Local API](docs/API.md) for supported
 fields, streaming usage and current limits.
 
 ## Requirements
@@ -235,8 +236,9 @@ listed below.
   message never reload the 167 GB checkpoint.
 - **Native resident chat API.** Reuse the same model and expert cache across
   stateless Chat Completions requests, rebuild the official DeepSeek role/EOS
-  sequence from `messages`, and stream UTF-8-safe SSE token deltas from native C
-  without a Python service or external inference runtime.
+  and DSML tool sequence from `messages`, return validated function calls, and
+  stream UTF-8-safe SSE deltas from native C without a Python service or
+  external inference runtime.
 
 ## Inference Correctness
 

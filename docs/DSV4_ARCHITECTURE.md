@@ -215,6 +215,14 @@ encoding, keeping CJK text and emoji valid UTF-8. The server handles one request
 at a time because concurrent generations would need independent multi-gigabyte
 context and expert-cache state on a laptop.
 
+When a request declares function tools, their JSON schemas are appended to the
+published DeepSeek-V4 DSML instruction block. Generated DSML is buffered until
+the complete call is available, checked against the declared tool names, and
+converted to ordinary Chat Completions `tool_calls`. Parallel call IDs are
+unique and the next request must provide exactly one matching result per ID.
+The engine never executes a tool. Tool-capable SSE connections receive periodic
+comments during long model work, then a complete call delta and final usage.
+
 ## Prompt-lookup speculative verification
 
 Before an ordinary decode step, the CLI searches the committed token history

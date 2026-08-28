@@ -27,6 +27,7 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
 | C99 + OpenMP 单进程推理 | 适配 Hyper-Connection、压缩滑窗注意力、YaRN RoPE、Hadamard、DeepSeek tokenizer 和 chat template |
 | 增量上下文 | 适配 DeepSeek 的 KV、compressor 和 Hyper-Connection 状态，使后续输入不必重放整段对话 |
 | 独立小模型正确性门禁 | 构建四层 DeepSeek tiny graph，并与独立 Python 标量实现逐 float 对照 |
+| DeepSeek-V4 DSML 工具协议 | 把公开的函数 schema、invoke/parameter grammar、assistant 历史与工具结果布局适配为有界 C 请求/输出处理 |
 
 ## 3. 本项目原创工程机制
 
@@ -73,8 +74,8 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
 15. **跨轮次复用**：常驻 chat 保留模型、KV/compressor、专家缓存和热权重，只
     处理新增输入；token 立即写到 stdout，中止回答或 `/reset` 都不重新加载权重。
 16. **原生常驻聊天接口**：无状态 Chat Completions 请求复用 checkpoint、热权重、
-    专家缓存、tokenizer 和 worker pools；根据完整消息历史重建官方角色/EOS token
-    序列，并直接输出 UTF-8 安全的 SSE delta，不依赖其他推理运行时。
+    专家缓存、tokenizer 和 worker pools；重建角色/EOS/工具历史，校验已声明的
+    函数调用与匹配结果，并直接输出 UTF-8 安全的 SSE delta，不依赖其他运行时。
 
 主要实现位置：模型调度、I/O、缓存和投机验证位于
 [`src/dsv4/dsv4_model.c`](../src/dsv4/dsv4_model.c) 与
@@ -83,11 +84,13 @@ DeepSeek-V4-Flash-0731 适配，以及本项目新增的原创工程机制。这
 [`src/dsv4/dsv4_config.c`](../src/dsv4/dsv4_config.c) 和
 [`scripts/try-dsv4.sh`](../scripts/try-dsv4.sh)；常驻对话、投机调度与流式输出位于
 [`src/cli/dsv4_run.c`](../src/cli/dsv4_run.c)；有界 JSON 解析、消息序列重建和
-UTF-8 边界处理位于 [`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c)。相关测试位于
+UTF-8 边界处理位于 [`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c)，DSML 校验
+位于 [`src/cli/dsv4_dsml.c`](../src/cli/dsv4_dsml.c)。相关测试位于
 [`tests/unit/test_dsv4_ops.c`](../tests/unit/test_dsv4_ops.c)、
 [`tests/unit/test_dsv4_model.c`](../tests/unit/test_dsv4_model.c) 和
 [`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c)，以及
-[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c)。
+[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c) 和
+[`tests/unit/test_dsv4_dsml.c`](../tests/unit/test_dsv4_dsml.c)。
 
 ## 术语与证据
 

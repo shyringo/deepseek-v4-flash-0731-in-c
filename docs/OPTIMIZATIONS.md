@@ -30,6 +30,7 @@ copyright and licensing.
 | Single-process C99 + OpenMP inference | Implement Hyper-Connection, compressed sliding-window attention, YaRN RoPE, Hadamard, the DeepSeek tokenizer and chat template |
 | Incremental context | Retain DeepSeek KV, compressor and Hyper-Connection state so later messages do not replay the transcript |
 | Independent tiny-model correctness gate | Build a four-layer DeepSeek graph and compare every float against an independent scalar Python implementation |
+| DeepSeek-V4 DSML tool contract | Adapt the published function schema, invoke/parameter grammar, assistant history and tool-result layout to bounded C request/output handling |
 
 ## 3. Original engineering mechanisms in this project
 
@@ -89,8 +90,9 @@ scheduling details.
     and avoid reloading weights after cancellation or `/reset`.
 16. **Native resident chat API:** retain the checkpoint, hot weights, expert
     cache, tokenizer and worker pools across stateless Chat Completions
-    requests; reconstruct the official role/EOS token sequence from complete
-    message history and emit UTF-8-safe SSE deltas without another runtime.
+    requests; reconstruct role/EOS/tool history, validate declared function
+    calls and matched results, and emit UTF-8-safe SSE deltas without another
+    runtime.
 
 Primary implementation locations: model scheduling, I/O, caching and
 speculative verification are in
@@ -101,12 +103,14 @@ planning is in [`src/dsv4/dsv4_config.c`](../src/dsv4/dsv4_config.c) and
 [`scripts/try-dsv4.sh`](../scripts/try-dsv4.sh); resident chat, speculation and
 streaming output are in [`src/cli/dsv4_run.c`](../src/cli/dsv4_run.c).
 Bounded JSON parsing, message reconstruction and UTF-8 boundary handling are in
-[`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c). Numerical and transport tests
+[`src/cli/dsv4_http.c`](../src/cli/dsv4_http.c); DSML validation is in
+[`src/cli/dsv4_dsml.c`](../src/cli/dsv4_dsml.c). Numerical and transport tests
 are in
 [`tests/unit/test_dsv4_ops.c`](../tests/unit/test_dsv4_ops.c),
 [`tests/unit/test_dsv4_model.c`](../tests/unit/test_dsv4_model.c) and
 [`tests/unit/test_dsv4_prompt.c`](../tests/unit/test_dsv4_prompt.c), plus
-[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c).
+[`tests/unit/test_dsv4_http.c`](../tests/unit/test_dsv4_http.c) and
+[`tests/unit/test_dsv4_dsml.c`](../tests/unit/test_dsv4_dsml.c).
 
 ## Terminology and evidence
 

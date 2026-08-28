@@ -11,7 +11,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(deepseek-v4-flash-0731-in-c
-        VERSION 0.2.0
+        VERSION 0.3.0
         DESCRIPTION "Run DeepSeek-V4-Flash-0731 on CPU from native FP8/FP4 weights"
         LANGUAGES C)
 
@@ -74,7 +74,8 @@ if(OpenMP_C_FOUND)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
-add_executable(dsv4_cli src/cli/dsv4_run.c src/cli/dsv4_http.c)
+add_executable(dsv4_cli src/cli/dsv4_run.c src/cli/dsv4_http.c
+  src/cli/dsv4_dsml.c)
 set_target_properties(dsv4_cli PROPERTIES OUTPUT_NAME dsv4)
 target_include_directories(dsv4_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
 target_link_libraries(dsv4_cli PRIVATE dsv4)
@@ -100,6 +101,11 @@ add_executable(test_dsv4_http tests/unit/test_dsv4_http.c src/cli/dsv4_http.c)
 target_include_directories(test_dsv4_http PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
 target_link_libraries(test_dsv4_http PRIVATE dsv4)
+add_executable(test_dsv4_dsml tests/unit/test_dsv4_dsml.c
+  src/cli/dsv4_dsml.c src/cli/dsv4_http.c)
+target_include_directories(test_dsv4_dsml PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)
+target_link_libraries(test_dsv4_dsml PRIVATE dsv4)
 
 set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 set(MODEL ${CMAKE_CURRENT_SOURCE_DIR}/model/DeepSeek-V4-Flash-0731)
@@ -111,6 +117,7 @@ add_test(NAME dsv4_st      COMMAND test_dsv4_st ${FIX}/st
          ${CMAKE_CURRENT_BINARY_DIR}/st_index.json)
 add_test(NAME dsv4_model   COMMAND test_dsv4_model ${FIX}/tiny_dsv4)
 add_test(NAME dsv4_http    COMMAND test_dsv4_http)
+add_test(NAME dsv4_dsml    COMMAND test_dsv4_dsml)
 
 # The tokenizer test needs the released vocabulary (6 MB), which is not in this
 # repository. Registered UNCONDITIONALLY so ctest reports Skipped rather than

@@ -2,6 +2,26 @@
 
 All notable changes to this project.
 
+## [0.3.0]
+
+### Added
+- OpenAI-compatible function tools with `auto` / `none` selection, parallel
+  calls, assistant tool-call history and matched tool-result replay.
+- Bounded DeepSeek-V4 DSML parsing with declared-tool validation, complete
+  JSON arguments, unique call IDs and narrow recovery for observed
+  unconstrained-checkpoint closing-tag variants.
+- SSE tool-call chunks, final usage, `[DONE]`, and periodic keep-alive comments
+  during long tool-capable prefill/generation.
+- Full-checkpoint weather, numeric, parallel, two-round and official OpenAI
+  JavaScript SDK streaming verification.
+
+### Security
+- Tool names must be declared by the request; every parallel call ID needs
+  exactly one result. Unknown, duplicate, truncated or ambiguous calls fail
+  closed. The engine returns calls but never executes tools.
+- `strict: true`, forced/required tool choice and thinking-mode tools remain
+  explicitly unsupported rather than being silently weakened.
+
 ## [0.2.0]
 
 ### Added

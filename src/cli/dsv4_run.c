@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <ctype.h>
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
@@ -23,11 +24,13 @@
 #include <strings.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
 
 #include "dsv4.h"
+#include "dsv4_dsml.h"
 #include "dsv4_http.h"
 #include "dsv4_internal.h"
 
@@ -472,6 +475,9 @@ struct DSV4ServerCall {
     int has_seed;
     int has_temperature;
     int has_top_p;
+    int tools_enabled;
+    char *tool_names[DSV4_HTTP_MAX_TOOLS];
+    size_t tool_count;
     uint32_t max_tokens;
     uint64_t seed;
     double temperature;
@@ -482,6 +488,12 @@ struct DSV4ServerCall {
     DSV4Buffer answer;
     DSV4ServerStream stream;
     DSV4Output output;
+    pthread_t heartbeat_thread;
+    pthread_mutex_t heartbeat_mutex;
+    pthread_cond_t heartbeat_cond;
+    int heartbeat_started;
+    int heartbeat_stop;
+    int heartbeat_failed;
 };
 
 static int server_buffer_write(void *context, const char *data, size_t length)
@@ -734,6 +746,65 @@ static int server_stream_role(DSV4ServerCall *call)
     return server_stream_send(call, &event);
 }
 
+static void *server_heartbeat_main(void *context)
+{
+    DSV4ServerCall *call = (DSV4ServerCall *)context;
+    static const char heartbeat[] = ": keep-alive\n\n";
+    pthread_mutex_lock(&call->heartbeat_mutex);
+    while (!call->heartbeat_stop) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 10;
+        const int rc = pthread_cond_timedwait(
+            &call->heartbeat_cond, &call->heartbeat_mutex, &deadline);
+        if (call->heartbeat_stop) break;
+        if (rc != ETIMEDOUT) continue;
+        pthread_mutex_unlock(&call->heartbeat_mutex);
+        const int sent = server_socket_send_all(
+            call->client, heartbeat, sizeof(heartbeat) - 1u);
+        pthread_mutex_lock(&call->heartbeat_mutex);
+        if (!sent) {
+            call->heartbeat_failed = 1;
+            call->heartbeat_stop = 1;
+        }
+    }
+    pthread_mutex_unlock(&call->heartbeat_mutex);
+    return NULL;
+}
+
+static int server_heartbeat_start(DSV4ServerCall *call)
+{
+    if (pthread_mutex_init(&call->heartbeat_mutex, NULL) != 0) return 0;
+    if (pthread_cond_init(&call->heartbeat_cond, NULL) != 0) {
+        pthread_mutex_destroy(&call->heartbeat_mutex);
+        return 0;
+    }
+    call->heartbeat_stop = 0;
+    call->heartbeat_failed = 0;
+    if (pthread_create(&call->heartbeat_thread, NULL,
+                       server_heartbeat_main, call) != 0) {
+        pthread_cond_destroy(&call->heartbeat_cond);
+        pthread_mutex_destroy(&call->heartbeat_mutex);
+        return 0;
+    }
+    call->heartbeat_started = 1;
+    return 1;
+}
+
+static int server_heartbeat_finish(DSV4ServerCall *call)
+{
+    if (!call->heartbeat_started) return 1;
+    pthread_mutex_lock(&call->heartbeat_mutex);
+    call->heartbeat_stop = 1;
+    pthread_cond_signal(&call->heartbeat_cond);
+    pthread_mutex_unlock(&call->heartbeat_mutex);
+    pthread_join(call->heartbeat_thread, NULL);
+    pthread_cond_destroy(&call->heartbeat_cond);
+    pthread_mutex_destroy(&call->heartbeat_mutex);
+    call->heartbeat_started = 0;
+    return !call->heartbeat_failed;
+}
+
 static int server_stream_content(void *context,
                                  const char *data, size_t length)
 {
@@ -764,10 +835,12 @@ static int server_call_begin(DSV4ServerCall *call)
     call->output.last_byte = 0;
     call->output.failed = 0;
     call->output.append_final_newline = 0;
-    if (!call->streaming) {
+    if (!call->streaming || call->tools_enabled) {
         call->output.write = server_buffer_write;
         call->output.context = &call->answer;
-        return 1;
+        if (!call->streaming) return 1;
+        return server_stream_headers(call->client) &&
+               server_stream_role(call) && server_heartbeat_start(call);
     }
     call->stream.call = call;
     dsv4_utf8_stream_init(&call->stream.utf8,
@@ -816,9 +889,219 @@ static int server_stream_finish(DSV4ServerCall *call, int prompt_tokens,
     return server_socket_send_all(call->client, done, sizeof(done) - 1u);
 }
 
+static int server_tool_allowed(const DSV4ServerCall *call, const char *name)
+{
+    for (size_t i = 0; i < call->tool_count; ++i)
+        if (strcmp(call->tool_names[i], name) == 0) return 1;
+    return 0;
+}
+
+static int server_has_visible_text(const char *text)
+{
+    if (!text) return 0;
+    while (*text) {
+        if (!isspace((unsigned char)*text)) return 1;
+        ++text;
+    }
+    return 0;
+}
+
+static int server_stream_tool_call(DSV4ServerCall *call,
+                                   const DSV4DsmlToolCall *tool,
+                                   size_t index)
+{
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    int ok = server_buffer_printf(
+        &event,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":%zu,\"id\":\"call-%s-%zu\","
+        "\"type\":\"function\",\"function\":{\"name\":",
+        call->id, call->created, index, call->id, index);
+    if (ok) ok = dsv4_buffer_append_json_string(
+        &event, tool->name, strlen(tool->name));
+    if (ok) ok = dsv4_buffer_append_string(&event, ",\"arguments\":");
+    if (ok) ok = dsv4_buffer_append_json_string(
+        &event, tool->arguments, strlen(tool->arguments));
+    if (ok) ok = server_buffer_printf(
+        &event, "}}]},\"finish_reason\":null}]%s}",
+        call->include_usage ? ",\"usage\":null" : "");
+    if (!ok) {
+        dsv4_buffer_free(&event);
+        return 0;
+    }
+    return server_stream_send(call, &event);
+}
+
+static int server_stream_tool_finish(DSV4ServerCall *call,
+                                     const DSV4DsmlResult *parsed,
+                                     int prompt_tokens,
+                                     int generated_tokens,
+                                     int truncated)
+{
+    if (server_has_visible_text(parsed->content) &&
+        !server_stream_content(call, parsed->content,
+                               strlen(parsed->content)))
+        return 0;
+    for (size_t i = 0; i < parsed->call_count; ++i)
+        if (!server_stream_tool_call(call, &parsed->calls[i], i)) return 0;
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    int ok = server_buffer_printf(
+        &event,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"%s\"}]%s}",
+        call->id, call->created,
+        parsed->call_count ? "tool_calls" : truncated ? "length" : "stop",
+        call->include_usage ? ",\"usage\":null" : "");
+    if (!ok) {
+        dsv4_buffer_free(&event);
+        return 0;
+    }
+    if (!server_stream_send(call, &event)) return 0;
+    if (call->include_usage) {
+        dsv4_buffer_init(&event);
+        ok = server_buffer_printf(
+            &event,
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+            "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":%d,"
+            "\"completion_tokens\":%d,\"total_tokens\":%d}}",
+            call->id, call->created, prompt_tokens, generated_tokens,
+            prompt_tokens + generated_tokens);
+        if (!ok) {
+            dsv4_buffer_free(&event);
+            return 0;
+        }
+        if (!server_stream_send(call, &event)) return 0;
+    }
+    static const char done[] = "data: [DONE]\n\n";
+    return server_socket_send_all(call->client, done, sizeof(done) - 1u);
+}
+
+static int server_nonstream_tool_finish(DSV4ServerCall *call,
+                                        const DSV4DsmlResult *parsed,
+                                        int prompt_tokens,
+                                        int generated_tokens,
+                                        int truncated)
+{
+    DSV4Buffer response;
+    dsv4_buffer_init(&response);
+    int ok = server_buffer_printf(
+        &response,
+        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+        "\"created\":%lld,\"model\":\"deepseek-v4-flash-0731-in-c\","
+        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+        "\"content\":",
+        call->id, call->created);
+    if (ok && server_has_visible_text(parsed->content))
+        ok = dsv4_buffer_append_json_string(
+            &response, parsed->content, strlen(parsed->content));
+    else if (ok)
+        ok = dsv4_buffer_append_string(&response, "null");
+    if (ok && parsed->call_count)
+        ok = dsv4_buffer_append_string(&response, ",\"tool_calls\":[");
+    for (size_t i = 0; ok && i < parsed->call_count; ++i) {
+        if (i) ok = dsv4_buffer_append_string(&response, ",");
+        if (ok) ok = server_buffer_printf(
+            &response,
+            "{\"id\":\"call-%s-%zu\",\"type\":\"function\","
+            "\"function\":{\"name\":",
+            call->id, i);
+        if (ok) ok = dsv4_buffer_append_json_string(
+            &response, parsed->calls[i].name,
+            strlen(parsed->calls[i].name));
+        if (ok) ok = dsv4_buffer_append_string(&response, ",\"arguments\":");
+        if (ok) ok = dsv4_buffer_append_json_string(
+            &response, parsed->calls[i].arguments,
+            strlen(parsed->calls[i].arguments));
+        if (ok) ok = dsv4_buffer_append_string(&response, "}}");
+    }
+    if (ok && parsed->call_count)
+        ok = dsv4_buffer_append_string(&response, "]");
+    if (ok) ok = server_buffer_printf(
+        &response,
+        "},\"finish_reason\":\"%s\"}],\"usage\":{"
+        "\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+        "\"total_tokens\":%d}}",
+        parsed->call_count ? "tool_calls" : truncated ? "length" : "stop",
+        prompt_tokens, generated_tokens, prompt_tokens + generated_tokens);
+    if (ok) ok = server_response(call->client, 200, "OK",
+                                  "application/json; charset=utf-8",
+                                  response.data, response.length);
+    dsv4_buffer_free(&response);
+    return ok;
+}
+
+static int server_stream_error_event(DSV4ServerCall *call,
+                                     const char *message)
+{
+    DSV4Buffer event;
+    dsv4_buffer_init(&event);
+    int ok = dsv4_buffer_append_string(
+                 &event, "data: {\"error\":{\"message\":") &&
+             dsv4_buffer_append_json_string(
+                 &event, message, strlen(message)) &&
+             dsv4_buffer_append_string(
+                 &event, ",\"type\":\"server_error\"}}");
+    if (ok) ok = server_stream_send(call, &event);
+    else dsv4_buffer_free(&event);
+    static const char done[] = "data: [DONE]\n\n";
+    return ok && server_socket_send_all(
+        call->client, done, sizeof(done) - 1u);
+}
+
+static int server_tool_finish(DSV4ServerCall *call, int prompt_tokens,
+                              int generated_tokens, int truncated)
+{
+    if (getenv("DSV4_DEBUG_TOOL_OUTPUT")) {
+        fputs("dsv4: raw tool-capable output begin\n", stderr);
+        if (call->answer.length)
+            fwrite(call->answer.data, 1, call->answer.length, stderr);
+        fputs("\ndsv4: raw tool-capable output end\n", stderr);
+    }
+    DSV4DsmlResult parsed;
+    char error[256] = {0};
+    if (!dsv4_dsml_parse(call->answer.data ? call->answer.data : "",
+                         call->answer.length, &parsed,
+                         error, sizeof(error))) {
+        if (!call->streaming)
+            return server_error_response(call->client, 500,
+                                          "Internal Server Error", error);
+        return server_stream_error_event(call, error);
+    }
+    for (size_t i = 0; i < parsed.call_count; ++i) {
+        if (!server_tool_allowed(call, parsed.calls[i].name)) {
+            dsv4_dsml_result_free(&parsed);
+            if (!call->streaming)
+                return server_error_response(
+                    call->client, 500, "Internal Server Error",
+                    "model called a tool that was not declared");
+            return server_stream_error_event(
+                call, "model called a tool that was not declared");
+        }
+    }
+    const int ok = call->streaming
+        ? server_stream_tool_finish(call, &parsed,
+                                    prompt_tokens, generated_tokens, truncated)
+        : server_nonstream_tool_finish(call, &parsed,
+                                       prompt_tokens, generated_tokens, truncated);
+    dsv4_dsml_result_free(&parsed);
+    return ok;
+}
+
 static int server_call_finish(DSV4ServerCall *call, int prompt_tokens,
                               int generated_tokens, int truncated)
 {
+    if (call->tools_enabled) {
+        if (call->streaming && !server_heartbeat_finish(call)) return 0;
+        return server_tool_finish(call, prompt_tokens,
+                                  generated_tokens, truncated);
+    }
     int ok = 0;
     if (call->streaming) {
         ok = server_stream_finish(call, prompt_tokens,
@@ -854,10 +1137,13 @@ static int server_call_finish(DSV4ServerCall *call, int prompt_tokens,
 static void server_call_dispose(DSV4ServerCall *call)
 {
     if (!call) return;
+    if (call->heartbeat_started) (void)server_heartbeat_finish(call);
     if (call->streaming && call->output_started)
         dsv4_utf8_stream_free(&call->stream.utf8);
     if (call->client >= 0) close(call->client);
     free(call->rendered_prompt);
+    for (size_t i = 0; i < call->tool_count; ++i)
+        free(call->tool_names[i]);
     dsv4_buffer_free(&call->answer);
     memset(call, 0, sizeof(*call));
     call->client = -1;
@@ -945,6 +1231,14 @@ static int server_next_call(int server, const char *base_system,
             server_call_dispose(call);
             continue;
         }
+        if (request.tool_count && reasoning_effort) {
+            dsv4_http_chat_request_free(&request);
+            (void)server_error_response(
+                client, 400, "Bad Request",
+                "tool calling currently requires non-thinking server mode");
+            server_call_dispose(call);
+            continue;
+        }
         call->rendered_prompt = dsv4_http_render_messages(
             &request, base_system, reasoning_effort, eos_text,
             error, sizeof(error));
@@ -964,6 +1258,24 @@ static int server_next_call(int server, const char *base_system,
         call->temperature = request.temperature;
         call->has_top_p = request.has_top_p;
         call->top_p = request.top_p;
+        call->tools_enabled = request.tool_count > 0 &&
+                              !request.tool_choice_none;
+        call->tool_count = request.tool_count;
+        int copied_tools = 1;
+        for (size_t i = 0; i < request.tool_count; ++i) {
+            call->tool_names[i] = strdup(request.tools[i].name);
+            if (!call->tool_names[i]) {
+                copied_tools = 0;
+                break;
+            }
+        }
+        if (!copied_tools) {
+            dsv4_http_chat_request_free(&request);
+            (void)server_error_response(client, 500, "Internal Server Error",
+                                        "out of memory preparing tools");
+            server_call_dispose(call);
+            continue;
+        }
         dsv4_http_chat_request_free(&request);
         call->created = (long long)time(NULL);
         const int length = snprintf(
