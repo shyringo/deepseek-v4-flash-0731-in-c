@@ -77,8 +77,16 @@ jobs:
       - name: Fetch official tokenizer.json (6 MB)
         run: |
           mkdir -p /tmp/dsv4-model
-          curl -sfL --max-time 120 -o /tmp/dsv4-model/tokenizer.json \
-            "https://www.modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/f981a343464c25f82b901e5882716b3b2fa514de/tokenizer.json"
+          MODELSCOPE_URL="https://www.modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/f981a343464c25f82b901e5882716b3b2fa514de/tokenizer.json"
+          HUGGINGFACE_URL="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/9e165c30e2704aec5d9d593cce3eebd58bbef1cb/tokenizer.json"
+          if ! curl -sfL --retry 2 --retry-all-errors --retry-delay 3 \
+              --connect-timeout 20 --max-time 90 \
+              -o /tmp/dsv4-model/tokenizer.json "$MODELSCOPE_URL"; then
+            curl -sfL --retry 2 --retry-all-errors --retry-delay 3 \
+              --connect-timeout 20 --max-time 90 \
+              -o /tmp/dsv4-model/tokenizer.json "$HUGGINGFACE_URL"
+          fi
+          echo "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf  /tmp/dsv4-model/tokenizer.json" | sha256sum -c -
       - name: Run parity
         run: DSV4_MODEL_DIR=/tmp/dsv4-model python3 tools/test_dsv4_tokenizer_parity.py /tmp/dsv4-model
 
