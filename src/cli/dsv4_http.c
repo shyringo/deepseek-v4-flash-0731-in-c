@@ -405,17 +405,40 @@ char *dsv4_http_render_messages(const DSV4HttpChatRequest *request,
         }
         if (strcmp(message->role, "user") == 0 ||
             strcmp(message->role, "developer") == 0) {
-            if (assistant_open || tool_results || !message->content[0]) {
+            if (assistant_open || tool_results) {
                 dsv4_http_error(error, error_capacity,
                                 "invalid user/assistant/tool message order");
                 ok = 0;
                 break;
             }
+            DSV4Buffer user_group;
+            dsv4_buffer_init(&user_group);
+            size_t group_end = index;
+            while (group_end < request->message_count &&
+                   (strcmp(request->messages[group_end].role, "user") == 0 ||
+                    strcmp(request->messages[group_end].role,
+                           "developer") == 0)) {
+                if (!request->messages[group_end].content[0] ||
+                    (user_group.length &&
+                     !dsv4_buffer_append_string(&user_group, "\n\n")) ||
+                    !dsv4_buffer_append_string(
+                        &user_group, request->messages[group_end].content)) {
+                    ok = 0;
+                    break;
+                }
+                ++group_end;
+            }
+            if (!ok) {
+                dsv4_buffer_free(&user_group);
+                dsv4_http_error(error, error_capacity,
+                                "invalid or oversized user message group");
+                break;
+            }
             const int needed = first
-                ? dsv4_format_prompt(NULL, 0, message->content,
+                ? dsv4_format_prompt(NULL, 0, user_group.data,
                                      system.data ? system.data : "",
                                      reasoning_effort)
-                : dsv4_format_turn(NULL, 0, message->content,
+                : dsv4_format_turn(NULL, 0, user_group.data,
                                    reasoning_effort);
             char *turn = needed >= 0
                        ? (char *)malloc((size_t)needed + 1u) : NULL;
@@ -423,20 +446,23 @@ char *dsv4_http_render_messages(const DSV4HttpChatRequest *request,
                 dsv4_http_error(error, error_capacity,
                                 "out of memory rendering messages");
                 ok = 0;
+                dsv4_buffer_free(&user_group);
                 break;
             }
             if (first)
                 dsv4_format_prompt(turn, (size_t)needed + 1u,
-                                   message->content,
+                                   user_group.data,
                                    system.data ? system.data : "",
                                    reasoning_effort);
             else
                 dsv4_format_turn(turn, (size_t)needed + 1u,
-                                 message->content, reasoning_effort);
+                                 user_group.data, reasoning_effort);
             ok = dsv4_buffer_append(&prompt, turn, (size_t)needed);
             free(turn);
+            dsv4_buffer_free(&user_group);
             first = 0;
             assistant_open = 1;
+            index = group_end - 1u;
         } else if (strcmp(message->role, "assistant") == 0) {
             if (!assistant_open ||
                 (!message->content[0] && !message->tool_call_count) ||

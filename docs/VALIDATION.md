@@ -170,6 +170,11 @@ mode. These are protocol/correctness checks, not performance records:
 6. `openai` JavaScript SDK 6.15.0 consumed the SSE endpoint directly and
    reconstructed `add_numbers` plus `{"a":17,"b":25}` without a custom stream
    parser.
+7. DeepSeek Harness rc.2 registered the endpoint through an isolated custom
+   `openai-completions` provider and sent its real headless request. The
+   captured default code-mode prompt was 8,916 tokens and its first step asked
+   for only one output token, so the expensive inference was stopped and no
+   end-to-end Harness compatibility claim is made.
 
 The unconstrained checkpoint emitted several deterministic but unambiguous
 DSML variations across these prompts: shortened closing tags, one duplicated

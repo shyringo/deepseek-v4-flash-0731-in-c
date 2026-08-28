@@ -11,7 +11,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(deepseek-v4-flash-0731-in-c
-        VERSION 0.3.0
+        VERSION 0.3.1
         DESCRIPTION "Run DeepSeek-V4-Flash-0731 on CPU from native FP8/FP4 weights"
         LANGUAGES C)
 

@@ -123,7 +123,8 @@ fail closed.
 - `model`: `deepseek-v4-flash-0731-in-c` or `deepseek-v4-flash-0731`.
 - `messages`: up to 128 messages. Initial `system` / `developer` instructions,
   ordinary `user` / `assistant` history, assistant `tool_calls`, and matched
-  `tool` results are supported.
+  `tool` results are supported. Consecutive user-side messages are joined with
+  a blank line, matching the published DeepSeek-V4 template.
 - `tools`: up to 64 function definitions. Function names must be unique.
 - `tool_choice`: omitted / `auto`, or `none`. `required` and named forced
   choices are rejected.
@@ -151,3 +152,9 @@ constrained decoding. Structured output, multimodal content, authentication,
 TLS, and remote-network listening are not implemented. Unsupported features
 return a clear error rather than being silently ignored. Request bodies are
 limited to 1 MiB and decoded message text to 256 KiB.
+
+The endpoint can be configured as a custom OpenAI Completions provider in
+DeepSeek Harness, but default headless code mode is not claimed as a practical
+laptop path: the observed Harness request carried an 8,916-token system/tool
+prompt and a one-token first-step output cap. The smaller direct Chat
+Completions and OpenAI SDK paths above are the validated integrations.

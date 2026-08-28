@@ -2,6 +2,19 @@
 
 All notable changes to this project.
 
+## [0.3.1]
+
+### Fixed
+- Consecutive `user` / `developer` messages are merged with a blank line as
+  required by the published DeepSeek-V4 template. This supports clients that
+  append a separate runtime-context user message.
+
+### Documented
+- DeepSeek Harness headless code mode reached the local endpoint, but its
+  default request contained an 8,916-token prompt with a one-token first-step
+  output cap. End-to-end Harness usability is therefore not claimed for the
+  reference laptop configuration.
+
 ## [0.3.0]
 
 ### Added

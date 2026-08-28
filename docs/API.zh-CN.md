@@ -114,7 +114,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - `model`：`deepseek-v4-flash-0731-in-c` 或 `deepseek-v4-flash-0731`。
 - `messages`：最多 128 条消息。支持开头的 `system` / `developer` 指令、普通
-  `user` / `assistant` 历史、assistant `tool_calls` 与匹配的 `tool` 结果。
+  `user` / `assistant` 历史、assistant `tool_calls` 与匹配的 `tool` 结果。连续
+  user 侧消息会按照公开的 DeepSeek-V4 模板用空行合并。
 - `tools`：最多 64 个函数定义；函数名不能重复。
 - `tool_choice`：省略、`auto` 或 `none`。暂不支持 `required` 或指定函数强制调用。
 - `max_tokens` 或 `max_completion_tokens`：1 到 65,536。启动服务时没有指定
@@ -138,3 +139,8 @@ thinking 服务模式；由于本版本没有实现完整 JSON Schema
 约束解码，`strict: true` 会被拒绝。目前不支持结构化输出、多模态消息、身份
 验证、TLS 或局域网监听；遇到这些参数会明确报错，不会静默忽略。请求体最大
 1 MiB，解码后的消息文本最大 256 KiB。
+
+可以把本接口配置成 DeepSeek Harness 的自定义 OpenAI Completions provider，
+但当前不把默认 headless code mode 宣称为实用的笔记本方案：实测 Harness 请求
+包含 8,916-token 的系统/工具 prompt，而首步输出上限只有 1 token。上面的直接
+Chat Completions 与 OpenAI SDK 路径才是已经完成端到端验证的集成。

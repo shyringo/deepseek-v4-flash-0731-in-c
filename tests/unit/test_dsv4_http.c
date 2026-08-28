@@ -130,15 +130,19 @@ int main(void)
     CHECK(rendered == NULL && strstr(error, "duplicated") != NULL);
     dsv4_http_chat_request_free(&request);
 
-    static const char bad_history[] =
+    static const char consecutive_users[] =
         "{\"model\":\"deepseek-v4-flash-0731-in-c\",\"messages\":["
         "{\"role\":\"user\",\"content\":\"one\"},"
         "{\"role\":\"user\",\"content\":\"two\"}]}";
-    CHECK(dsv4_http_parse_chat_request(bad_history, strlen(bad_history),
+    CHECK(dsv4_http_parse_chat_request(
+                                       consecutive_users,
+                                       strlen(consecutive_users),
                                        &request, error, sizeof(error)));
     rendered = dsv4_http_render_messages(
         &request, NULL, NULL, "<EOS>", error, sizeof(error));
-    CHECK(rendered == NULL && strstr(error, "order") != NULL);
+    CHECK(rendered != NULL && strstr(rendered,
+        "<｜User｜>one\n\ntwo<｜Assistant｜></think>") != NULL);
+    free(rendered);
     dsv4_http_chat_request_free(&request);
 
     static const char tool_history[] =
