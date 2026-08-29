@@ -260,7 +260,8 @@ memory layout.
 For a smaller dense-model option, see
 [qwen3.8-27b-in-c](https://github.com/shyringo/qwen3.8-27b-in-c): run
 Qwen3.8-27B GGUFs on one laptop CPU, with a tested 8 GB memory path and up to
-2.52 token/s on the reference machine.
+2.52 token/s on the reference machine, plus a resident OpenAI-compatible API
+with function tools.
 
 ## License and Acknowledgements
 

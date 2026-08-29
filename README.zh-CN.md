@@ -238,7 +238,7 @@ make test
 如果你更需要参数量较小的 dense 模型，可以使用
 [qwen3.8-27b-in-c](https://github.com/shyringo/qwen3.8-27b-in-c)：在单颗笔记本
 CPU 上运行 Qwen3.8-27B GGUF；8 GB 内存机器已经过实测，参考机器最高
-2.52 token/s。
+2.52 token/s，并提供支持函数工具的模型常驻 OpenAI 兼容接口。
 
 ## 许可证与致谢
 
