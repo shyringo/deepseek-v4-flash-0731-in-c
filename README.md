@@ -263,6 +263,11 @@ Qwen3.8-27B GGUFs on one laptop CPU, with a tested 8 GB memory path and up to
 2.52 token/s on the reference machine, plus a resident OpenAI-compatible API
 with function tools.
 
+For Qwen's sparse 125B-A6B architecture, see
+[qwen3.8-flash-next-in-c](https://github.com/shyringo/qwen3.8-flash-next-in-c):
+native C inference for Qwen3.8-Flash-Next with 51B PLE, QSA, resident chat and
+exact batch throughput reaching near 10 token/s on the reference laptop CPU.
+
 ## License and Acknowledgements
 
 The code is licensed under Apache License 2.0. See [LICENSE](LICENSE) and
