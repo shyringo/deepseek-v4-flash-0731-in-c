@@ -266,7 +266,8 @@ with function tools.
 For Qwen's sparse 125B-A6B architecture, see
 [qwen3.8-flash-next-in-c](https://github.com/shyringo/qwen3.8-flash-next-in-c):
 native C inference for Qwen3.8-Flash-Next with 51B PLE, QSA, resident chat and
-exact batch throughput reaching near 10 token/s on the reference laptop CPU.
+an automatic 8 GB RAM path; exact batch throughput reaches near 10 token/s on
+the reference laptop CPU.
 
 ## License and Acknowledgements
 

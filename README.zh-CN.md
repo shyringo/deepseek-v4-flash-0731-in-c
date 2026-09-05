@@ -243,7 +243,7 @@ CPU 上运行 Qwen3.8-27B GGUF；8 GB 内存机器已经过实测，参考机器
 如果需要 Qwen 的 125B-A6B 稀疏架构，可以使用
 [qwen3.8-flash-next-in-c](https://github.com/shyringo/qwen3.8-flash-next-in-c)：
 原生 C 语言推理 Qwen3.8-Flash-Next，支持 51B PLE、QSA、常驻聊天，参考
-笔记本 CPU 的精确 batch 吞吐接近 10 token/s。
+笔记本 CPU 的精确 batch 吞吐接近 10 token/s，并可自动启用最低 8 GB 内存路径。
 
 ## 许可证与致谢
 
